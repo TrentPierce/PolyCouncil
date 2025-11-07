@@ -13,7 +13,7 @@ This creates a more reliable, research-friendly way to test, compare, and orches
   <img alt="Pull Requests" src="https://img.shields.io/github/issues-pr/TrentPierce/PolyCouncil?style=for-the-badge&color=brightgreen">
   <img alt="Issues" src="https://img.shields.io/github/issues/TrentPierce/PolyCouncil?style=for-the-badge&color=orange">
   <img alt="Stars" src="https://img.shields.io/github/stars/TrentPierce/PolyCouncil?style=for-the-badge&color=yellow">
-  <img alt="Last Commit" src="https://img.shields.io/github/TrentPierce/YOURNAME/PolyCouncil?style=for-the-badge&color=blue">
+  <img alt="Last Commit" src="https://img.shields.io/github/last-commit/TrentPierce/PolyCouncil?style=for-the-badge&color=blue">
 </p>
 
 Features
