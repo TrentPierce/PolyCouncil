@@ -45,7 +45,7 @@ Build your own research tools on top of a clean ensemble framework
 Perfect for hobbyists, researchers, and anyone who likes collecting too many models in LM Studio.
 
 Getting Started
-git clone https://github.com/YOURNAME/PolyCouncil
+git clone https://github.com/TrentPierce/PolyCouncil
 cd PolyCouncil
 python main.py
 
@@ -78,7 +78,7 @@ Check the config/ folder for examples and presets.
 
 Screenshots
 
-Coming soon — once you push your GUI screenshots.
+Coming soon
 
 Contributing
 
