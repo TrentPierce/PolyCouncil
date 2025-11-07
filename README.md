@@ -5,6 +5,17 @@ A multi-model deliberation engine for LM Studio.
 PolyCouncil runs multiple local LLMs in parallel, gathers their responses, and has them evaluate each other using a shared scoring rubric. After scoring, the models vote on which answer is best, producing a consensus-driven final result.
 This creates a more reliable, research-friendly way to test, compare, and orchestrate multiple models inside LM Studio.
 
+<p align="center">
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white">
+  <img alt="License" src="https://img.shields.io/badge/License-Polyform%20Noncommercial%201.0.0-yellow?style=for-the-badge">
+  <img alt="Status" src="https://img.shields.io/badge/Status-Active-success?style=for-the-badge">
+  <img alt="Platform" src="https://img.shields.io/badge/Platform-LM%20Studio-4B32FF?style=for-the-badge&logo=data:image/svg+xml;base64,">
+  <img alt="Pull Requests" src="https://img.shields.io/github/issues-pr/TrentPierce/PolyCouncil?style=for-the-badge&color=brightgreen">
+  <img alt="Issues" src="https://img.shields.io/github/issues/TrentPierce/PolyCouncil?style=for-the-badge&color=orange">
+  <img alt="Stars" src="https://img.shields.io/github/stars/TrentPierce/PolyCouncil?style=for-the-badge&color=yellow">
+  <img alt="Last Commit" src="https://img.shields.io/github/TrentPierce/YOURNAME/PolyCouncil?style=for-the-badge&color=blue">
+</p>
+
 Features
 
 Parallel model execution
