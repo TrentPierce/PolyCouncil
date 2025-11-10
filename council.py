@@ -260,6 +260,7 @@ def _build_voting_json_schema(ranges: dict) -> dict:
                 },
                 "additionalProperties": False
             },
+            "reasoning": {"type": "string"},
             "final_pick": {"type": "integer"}
         },
         "required": ["scores"],
@@ -374,6 +375,43 @@ def safe_load_vote_json(payload) -> Optional[dict]:
     return None
 
 # -----------------------
+# Refusal detection
+# -----------------------
+def is_refusal_answer(answer: str) -> bool:
+    """
+    Improved detection of refusal/non-answers
+    """
+    if not isinstance(answer, str):
+        return False
+    
+    text = answer.strip().lower()
+    
+    # Common refusal patterns
+    refusal_patterns = [
+        "i cannot", "i can't", "i'm unable", "i am unable",
+        "sorry, i cannot", "sorry i cannot",
+        "i don't have access", "i don't know",
+        "as an ai", "as a language model",
+        "i'm not able", "i am not able",
+        "i apologize, but",
+        "i cannot assist", "i can't assist",
+        "that would be inappropriate",
+        "i must decline"
+    ]
+    
+    # Check if answer starts with refusal (first 200 chars)
+    prefix = text[:200]
+    for pattern in refusal_patterns:
+        if pattern in prefix:
+            return True
+    
+    # Check if answer is too short and contains apology
+    if len(text) < 50 and ("sorry" in text or "apologize" in text):
+        return True
+    
+    return False
+
+# -----------------------
 # Roles / personas
 # -----------------------
 def assign_random_roles(selected_models: List[str], enabled: bool) -> Dict[str, Optional[str]]:
@@ -464,7 +502,232 @@ def best_effort_unload(base_url: str, models_to_unload: List[str], status_cb):
             break
 
 # -----------------------
-# Council orchestration (RUBRIC SCORING; no self ballots; tolerant validator)
+# IMPROVED VOTING SYSTEM
+# -----------------------
+def improved_voting_prompt(voter_id: str, peer_idx_map: dict, question: str, answers: dict) -> str:
+    """
+    Clearer prompt that emphasizes:
+    - Explicit scoring rules
+    - Examples of good vs bad answers
+    - Clear JSON structure with strict requirements
+    """
+    # Build answer block with clear separation
+    answer_blocks = []
+    for i, mid in peer_idx_map.items():
+        answer_blocks.append(f"=== ANSWER {i} ===\n{answers[mid]}\n")
+    
+    ballot = "\n".join(answer_blocks)
+    
+    return f"""You are evaluating answers to this question:
+"{question}"
+
+CRITICAL RULES:
+1. You CANNOT see or vote for your own answer (you are '{voter_id}')
+2. Score ONLY the numbered answers shown below
+3. Use EXACT integer scores based on these criteria
+
+SCORING RUBRIC (use full scale):
+- correctness (0-5): Is the answer factually accurate and complete?
+  * 5 = Perfect, fully correct
+  * 3 = Mostly correct with minor issues
+  * 0 = Wrong, refuses to answer, or says "sorry I can't help"
+  
+- relevance (0-3): Does it directly address the question?
+  * 3 = Perfectly on-topic
+  * 0 = Off-topic or refuses to answer
+  
+- specificity (0-3): Does it provide concrete details/examples?
+  * 3 = Highly specific with examples
+  * 1 = General information only
+  * 0 = Vague or no useful detail
+  
+- safety (0-2): Is it safe and ethical?
+  * 2 = Completely safe
+  * 0 = Contains harmful content
+  
+- conciseness (0-1): Is it appropriately brief?
+  * 1 = Concise and clear
+  * 0 = Overly verbose or too brief
+
+EXAMPLES:
+- If answer says "Sorry, I cannot help": correctness=0, relevance=0, specificity=0, safety=2, conciseness=1
+
+Return ONLY this JSON structure (no other text):
+{{
+  "scores": {{
+    "1": {{"correctness": <int>, "relevance": <int>, "specificity": <int>, "safety": <int>, "conciseness": <int>}},
+    "2": {{"correctness": <int>, "relevance": <int>, "specificity": <int>, "safety": <int>, "conciseness": <int>}},
+    ... for each answer number below
+  }},
+  "reasoning": "Brief explanation of your evaluation",
+  "final_pick": <int>
+}}
+
+ANSWERS TO EVALUATE:
+{ballot}
+
+Remember: Use the FULL scoring range (0 to max for each category). Be decisive, not neutral."""
+
+
+def validate_ballot_strict(
+    idx_map_peer: dict,
+    parsed: dict,
+    voter_model: str
+) -> tuple[bool, str]:
+    """
+    Returns (is_valid, error_message)
+    Rejects ballots with:
+    - Missing candidates
+    - All-zero scores (unless answer was truly bad)
+    - Self-voting attempts
+    """
+    if not isinstance(parsed, dict) or "scores" not in parsed:
+        return False, "Missing 'scores' key"
+    
+    scores = parsed["scores"]
+    if not isinstance(scores, dict):
+        return False, "Scores must be a dictionary"
+    
+    # Check all candidates are scored
+    expected_keys = {str(i) for i in idx_map_peer.keys()}
+    actual_keys = set(scores.keys())
+    
+    missing = expected_keys - actual_keys
+    if missing:
+        return False, f"Missing scores for candidates: {missing}"
+    
+    extra = actual_keys - expected_keys
+    if extra:
+        return False, f"Unexpected candidate keys: {extra}"
+    
+    # Check for self-voting (voter's own model shouldn't appear)
+    for idx, mid in idx_map_peer.items():
+        if mid == voter_model:
+            return False, f"Voter {voter_model} attempted to score itself at position {idx}"
+    
+    # Check all scores are valid dictionaries
+    required_metrics = {"correctness", "relevance", "specificity", "safety", "conciseness"}
+    for key, score_dict in scores.items():
+        if not isinstance(score_dict, dict):
+            return False, f"Score for candidate {key} is not a dictionary"
+        
+        actual_metrics = set(score_dict.keys())
+        if actual_metrics != required_metrics:
+            return False, f"Candidate {key} has wrong metrics: {actual_metrics}"
+        
+        # Validate ranges
+        ranges = {"correctness": 5, "relevance": 3, "specificity": 3, "safety": 2, "conciseness": 1}
+        for metric, value in score_dict.items():
+            if not isinstance(value, int):
+                return False, f"Candidate {key}, {metric}: must be integer, got {type(value)}"
+            if not (0 <= value <= ranges[metric]):
+                return False, f"Candidate {key}, {metric}={value} out of range [0, {ranges[metric]}]"
+    
+    # Warn about all-zero ballots (but don't reject - might be legitimate)
+    all_zeros = all(
+        sum(sc.values()) == 0 
+        for sc in scores.values()
+    )
+    if all_zeros:
+        return True, "WARNING: All scores are zero"
+    
+    return True, "Valid"
+
+
+async def vote_one_improved(
+    session: aiohttp.ClientSession,
+    base_url: str,
+    voter_model_id: str,
+    question: str,
+    answers: dict,
+    selected_models: list
+) -> tuple[str, Optional[dict], str]:
+    """
+    Simplified voting: Try json_schema once, then text mode once.
+    Return early on first valid ballot.
+    Returns: (voter_id, parsed_ballot, status_message)
+    """
+    peer_models = [m for m in selected_models if m != voter_model_id]
+    idx_map_peer = {i + 1: m for i, m in enumerate(peer_models)}
+    
+    _dbg(f"VOTE index map (voter={voter_model_id})", {i: mid for i, mid in idx_map_peer.items()})
+    
+    prompt = improved_voting_prompt(voter_model_id, idx_map_peer, question, answers)
+    _dbg(f"VOTE prompt (voter={voter_model_id})", prompt)
+    
+    # Try 1: JSON Schema (most reliable)
+    schema = _build_voting_json_schema({
+        "correctness": 5,
+        "relevance": 3,
+        "specificity": 3,
+        "safety": 2,
+        "conciseness": 1
+    })
+    
+    try:
+        content = await call_model(
+            session, base_url, voter_model_id, prompt,
+            temperature=0.0,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "vote_ballot", "schema": schema}
+            }
+        )
+        
+        _dbg(f"VOTE raw OUTPUT json_schema (voter={voter_model_id})", content)
+        
+        parsed = safe_load_vote_json(content)
+        if parsed:
+            is_valid, msg = validate_ballot_strict(idx_map_peer, parsed, voter_model_id)
+            if is_valid:
+                # Convert string keys to model IDs for consistency
+                normalized = {
+                    "scores": {idx_map_peer[int(k)]: v for k, v in parsed["scores"].items()},
+                    "final_pick": parsed.get("final_pick"),
+                    "reasoning": parsed.get("reasoning", "")
+                }
+                _dbg(f"VOTE ACCEPTED json_schema (voter={voter_model_id})", normalized)
+                return voter_model_id, normalized, f"Valid ballot via json_schema ({msg})"
+            else:
+                _dbg(f"VOTE REJECTED json_schema (voter={voter_model_id})", msg)
+    
+    except Exception as e:
+        _dbg(f"VOTE ERROR json_schema (voter={voter_model_id})", str(e))
+    
+    # Try 2: Plain text (fallback)
+    try:
+        content = await call_model(
+            session, base_url, voter_model_id, prompt,
+            temperature=0.0,
+            response_format=None
+        )
+        
+        _dbg(f"VOTE raw OUTPUT text (voter={voter_model_id})", content)
+        
+        parsed = safe_load_vote_json(content)
+        if parsed:
+            is_valid, msg = validate_ballot_strict(idx_map_peer, parsed, voter_model_id)
+            if is_valid:
+                normalized = {
+                    "scores": {idx_map_peer[int(k)]: v for k, v in parsed["scores"].items()},
+                    "final_pick": parsed.get("final_pick"),
+                    "reasoning": parsed.get("reasoning", "")
+                }
+                _dbg(f"VOTE ACCEPTED text (voter={voter_model_id})", normalized)
+                return voter_model_id, normalized, f"Valid ballot via text ({msg})"
+            else:
+                _dbg(f"VOTE REJECTED text (voter={voter_model_id})", msg)
+    
+    except Exception as e:
+        _dbg(f"VOTE ERROR text (voter={voter_model_id})", str(e))
+    
+    # Failed - return empty ballot with clear error
+    _dbg(f"VOTE FAILED ALL ATTEMPTS (voter={voter_model_id})", "No valid ballot produced")
+    return voter_model_id, None, f"Failed to obtain valid ballot from {short_id(voter_model_id)}"
+
+
+# -----------------------
+# Council orchestration (IMPROVED)
 # -----------------------
 async def council_round(
     base_url: str,
@@ -497,461 +760,87 @@ async def council_round(
         answers = {m: a for m, a in pairs}
         errors = {m: a for m, a in pairs if isinstance(a, str) and a.startswith("[ERROR")}
 
-        # ---------- VOTING ----------
+        # ---------- IMPROVED VOTING ----------
         status_cb("Models are voting…")
-
-        RUBRIC = {
-            "correctness": 5,   # factual accuracy (weight 5)
-            "relevance": 3,     # stays on task (weight 3)
-            "specificity": 3,   # concrete steps / references (weight 3)
-            "safety": 2,        # avoids harmful/illegal (weight 2)
-            "conciseness": 1    # avoids fluff (weight 1)
-        }
-        rubric_keys = list(RUBRIC.keys())
-
-        # Key normalization for tolerant parsing
-        KEY_ALIASES = {
-            "correctness": {"correctness","correct","accuracy","accurate","truth","truthfulness"},
-            "relevance": {"relevance","relevant","focus","on_topic"},
-            "specificity": {"specificity","specific","detail","detailedness","precision"},
-            "safety": {"safety","safe","alignment"},
-            "conciseness": {"conciseness","concise","brevity"},
-        }
-        ALIAS_TO_CANON = {alias: canon for canon, aliases in KEY_ALIASES.items() for alias in aliases}
-
-        def _canon_key(k: str) -> Optional[str]:
-            k = (k or "").strip().lower()
-            return ALIAS_TO_CANON.get(k, k if k in KEY_ALIASES else None)
-
-        def _round_half_up(x: float) -> int:
-            return int(math.floor(x + 0.5))
-
-        def _coerce_score_value(v, max_allowed: int) -> int:
-            """
-            Accepts:
-              - int / float (0..max)
-              - float 0..1 (scaled to 0..max)
-              - strings like "2", "2.0", "0.6", "80%", "3/5"
-            """
-            try:
-                if isinstance(v, (int, float)):
-                    val = float(v)
-                elif isinstance(v, str):
-                    s = v.strip()
-                    if s.endswith("%"):  # percentage
-                        p = float(s[:-1].strip())
-                        return _round_half_up(max(0.0, min(100.0, p)) * max_allowed / 100.0)
-                    if "/" in s:        # fraction
-                        num, den = s.split("/", 1)
-                        num = float(num.strip()); den = float(den.strip())
-                        if den != 0:
-                            return _round_half_up(max(0.0, min(1.0, num/den)) * max_allowed)
-                        return 0
-                    val = float(s)      # plain number
-                else:
-                    return 0
-            except Exception:
-                return 0
-
-            if 0.0 <= val <= 1.0 and max_allowed > 1:
-                return _round_half_up(val * max_allowed)
-            return max(0, min(max_allowed, _round_half_up(val)))
-
-        # PATCH: tolerant key parsing (accept "1", 1, "ans_1", etc.)
-        def _norm_key_to_index(k) -> Optional[int]:
-            try:
-                if isinstance(k, int):
-                    return k
-                s = str(k).strip()
-                s = s.strip("[](){} ")
-                s = re.sub(r"^(ans(?:wer)?[_\-]?|model[_\-]?|idx[_\-]?|id[_\-]?|item[_\-]?)*", "", s, flags=re.IGNORECASE)
-                m = re.search(r"(\d+)$", s)
-                return int(m.group(1)) if m else (int(s) if s.isdigit() else None)
-            except Exception:
-                return None
-
-        def _match_key_to_candidate(key: str, idx_map_peer: dict[int,str]) -> Optional[str]:
-            i = _norm_key_to_index(key)
-            if isinstance(i, int) and i in idx_map_peer:
-                return idx_map_peer[i]
-            if key in idx_map_peer.values():
-                return key
-            key_canon = canon_id(key)
-            key_short = short_id(key)
-            for mid in idx_map_peer.values():
-                if key == mid or key_canon == canon_id(mid) or key_short == short_id(mid):
-                    return mid
-            return None
-
-        # detect placeholder ballots like {"scores":{"<num>":{...}}}
-        def _has_placeholder_num(obj) -> bool:
-            if not isinstance(obj, dict):
-                return False
-            sc = obj.get("scores")
-            if isinstance(sc, dict):
-                return any(str(k).strip() in {"<num>", "<NUM>", "<Num>"} for k in sc.keys())
-            return False
-
-        # Prompts
-        def compact_prompt(voter_id: str, peer_idx_map: dict[int, str]) -> str:
-            lines = [f"[{i}] {mid}:\n{answers[mid]}\n" for i, mid in peer_idx_map.items()]
-            ballot = "\n".join(lines)
-            return (
-                f"You are '{voter_id}'. Your own answer is NOT shown.\n"
-                f"Question:\n{question}\n\n"
-                "Score EACH numbered answer using INTEGER keys exactly as lowercase: "
-                "correctness, relevance, specificity, safety, conciseness.\n"
-                "Ranges: correctness(0-5), relevance(0-3), specificity(0-3), safety(0-2), conciseness(0-1).\n"
-                "Hard rules for this question:\n"
-                "- If an answer exactly satisfies the instruction (e.g., says the capital of France as \"paris\"), "
-                "set correctness=5, relevance=3, specificity=3, safety=2, conciseness=1.\n"
-                "- If an answer replies \"sorry\" or refuses without giving the requested content, set correctness=0 and relevance=0.\n"
-                "- Otherwise score normally by the rubric.\n"
-                "Return JSON ONLY, no prose. Schema EXACTLY:\n"
-                '{'
-                '"scores":{"<num>":{"correctness":int,"relevance":int,"specificity":int,"safety":int,"conciseness":int}},'
-                '"final_pick": <num>'
-                '}\n'
-                'Key the "scores" object by the numeric labels 1..N exactly (as strings "1","2",...).\n'
-                "You MUST score EVERY listed answer key (1..N). Do not omit any key.\n"
-                "Use full numbers only when scoring using this scale. Decimals/%, x/y will be converted.\n\n"
-                "Answers:\n"
-                f"{ballot}"
-            )
-
-        def strict_miniprompt(voter_id: str, peer_idx_map: dict[int, str]) -> str:
-            nums = ", ".join(str(i) for i in peer_idx_map.keys())
-            return (
-                "Return JSON ONLY. No text. Schema:\n"
-                '{'
-                '"scores":{"<num>":{"correctness":int,"relevance":int,"specificity":int,"safety":int,"conciseness":int}},'
-                '"final_pick": <num>'
-                '}\n'
-                'Key the "scores" object by the numeric labels 1..N exactly (as strings "1","2",...).\n'
-                "Use EXACT lowercase keys: correctness, relevance, specificity, safety, conciseness. Integers only.\n"
-                "Hard rules for this question:\n"
-                "- If an answer exactly satisfies the instruction, set correctness=5, relevance=3, specificity=3, safety=2, conciseness=1.\n"
-                "- If an answer replies \"sorry\" or refuses without giving the requested content, set correctness=0 and relevance=0.\n"
-                "- Otherwise score normally by the rubric.\n"
-                f"Score each of these numbers: {nums}.\n"
-                "Ranges: correctness 0..5, relevance 0..3, specificity 0..3, safety 0..2, conciseness 0..1."
-            )
-
-        def coerce_and_clamp(idx_map_peer: dict[int, str], parsed: dict) -> Optional[dict]:
-            """
-            Accepts 'scores' as:
-            - dict: key = index/model id -> metrics dict or scalar
-            - list: each entry contains index/id + metrics or scalar
-            If only final_pick exists (scores empty), fabricate scores to avoid all-zero ballots.
-            """
-            if not isinstance(parsed, dict):
-                return None
-
-            scores_in = parsed.get("scores", {})
-            final_pick = parsed.get("final_pick", None)
-
-            def _expand_scalar_to_metrics(val_scalar) -> dict:
-                s5 = _coerce_score_value(val_scalar, 5)
-                return {
-                    "correctness": s5,
-                    "relevance": _coerce_score_value(s5 / 5, 3),
-                    "specificity": _coerce_score_value(s5 / 5, 3),
-                    "safety": _coerce_score_value(s5 / 5, 2),
-                    "conciseness": _coerce_score_value(s5 / 5, 1),
-                }
-
-            pairs: List[tuple[str, dict]] = []
-            # dict form
-            if isinstance(scores_in, dict):
-                for k, entry in scores_in.items():
-                    target = _match_key_to_candidate(str(k), idx_map_peer)
-                    if target is None: 
-                        continue
-                    if isinstance(entry, dict):
-                        pairs.append((target, entry))
-                    else:
-                        pairs.append((target, _expand_scalar_to_metrics(entry)))
-            # list form
-            elif isinstance(scores_in, list):
-                for e in scores_in:
-                    if not isinstance(e, dict): 
-                        continue
-                    mid = e.get("model") or e.get("id") or e.get("candidate")
-                    target = None
-                    if isinstance(mid, str):
-                        target = _match_key_to_candidate(mid, idx_map_peer)
-                    if target is None:
-                        idx = e.get("index") or e.get("i") or e.get("num")
-                        try: idx = int(idx)
-                        except Exception: idx = None
-                        target = idx_map_peer.get(idx) if idx in idx_map_peer else None
-                    if target is None: 
-                        continue
-                    metrics_raw = {k: v for k, v in e.items() if k not in {"model","id","candidate","index","i","num"}}
-                    if not metrics_raw:
-                        continue
-                    if len(metrics_raw) == 1 and not isinstance(next(iter(metrics_raw.values())), dict):
-                        scalar_val = next(iter(metrics_raw.values()))
-                        pairs.append((target, _expand_scalar_to_metrics(scalar_val)))
-                    else:
-                        pairs.append((target, metrics_raw))
-
-            # If we got nothing but do have a final_pick, fabricate scores
-            if not pairs and isinstance(final_pick, int) and 1 <= final_pick <= len(idx_map_peer):
-                chosen_mid = idx_map_peer.get(final_pick)
-                fabricated = {}
-                for i, mid in idx_map_peer.items():
-                    if mid == chosen_mid:
-                        fabricated[mid] = {"correctness":5,"relevance":3,"specificity":3,"safety":2,"conciseness":1}
-                    else:
-                        fabricated[mid] = {"correctness":0,"relevance":0,"specificity":0,"safety":0,"conciseness":0}
-                return {"scores": fabricated, "final_pick": final_pick}
-
-            cleaned = {mid: {mk: 0 for mk in KEY_ALIASES.keys()} for mid in idx_map_peer.values()}
-            for mid, raw in pairs:
-                if not isinstance(raw, dict): 
-                    continue
-                norm = {}
-                for k_raw, v in raw.items():
-                    ck = _canon_key(str(k_raw))
-                    if ck in KEY_ALIASES:
-                        norm[ck] = v
-                for mk, max_allowed in (("correctness",5),("relevance",3),("specificity",3),("safety",2),("conciseness",1)):
-                    cleaned[mid][mk] = _coerce_score_value(norm.get(mk, cleaned[mid][mk]), max_allowed)
-
-            matched = {m for m,_ in pairs}
-            missing = [mid for mid in idx_map_peer.values() if mid not in matched]
-            if missing:
-                _dbg("VOTE validator: candidates with no parsed scores (filled zeros)", [short_id(m) for m in missing])
-
-            out = {"scores": cleaned, "final_pick": final_pick}
-            try:
-                if all(sum(sc.values()) == 0 for sc in cleaned.values()) and isinstance(final_pick, int):
-                    # safety net: if everything is zero but final_pick exists, synthesize a minimal preference
-                    pick_mid = idx_map_peer.get(final_pick)
-                    if pick_mid:
-                        cleaned[pick_mid]["correctness"] = max(cleaned[pick_mid]["correctness"], 1)
-                        out["scores"] = cleaned
-            except Exception:
-                pass
-            return out
-
-        async def vote_one(voter_model_id: str) -> tuple[str, Any, dict]:
-            peer_models = [m for m in selected_models if m != voter_model_id]
-            idx_map_peer = {i + 1: m for i, m in enumerate(peer_models)}  # number -> model
-
-            _dbg(f"VOTE index map (voter={voter_model_id})", {i: mid for i, mid in idx_map_peer.items()})
-
-            prompt1 = compact_prompt(voter_model_id, idx_map_peer)
-            _dbg(f"VOTE prompt ATTEMPT 1 (voter={voter_model_id})", prompt1)
-
-            # Attempt 1a: json_object
-            if NO_JSON_OBJECT.get(voter_model_id):
-                content1 = None
+        
+        vote_results = await run_limited(
+            max_concurrency,
+            [lambda m=m: vote_one_improved(session, base_url, m, question, answers, selected_models) 
+             for m in selected_models]
+        )
+        
+        # Separate valid and invalid ballots
+        valid_votes = {}
+        invalid_votes = {}
+        vote_messages = {}
+        
+        for voter_id, ballot, msg in vote_results:
+            vote_messages[voter_id] = msg
+            if ballot is not None:
+                valid_votes[voter_id] = ballot
             else:
-                try:
-                    content1 = await call_model(
-                        session, base_url, voter_model_id, prompt1,
-                        temperature=0.0, sys_prompt=None,
-                        response_format={"type": "json_object"},
-                    )
-                except Exception as e:
-                    content1 = f"[ERROR during vote] {e}"
-                    if "'response_format.type' must be 'json_schema' or 'text'" in str(e):
-                        NO_JSON_OBJECT[voter_model_id] = True
-    
-            _dbg(f"VOTE raw OUTPUT ATTEMPT 1/json_object (voter={voter_model_id})", content1)
-            parsed1 = None if (isinstance(content1, str) and content1.startswith("[ERROR")) else safe_load_vote_json(content1)
-            if parsed1 and _has_placeholder_num(parsed1):
-                parsed1 = None
-            coerced1 = coerce_and_clamp(idx_map_peer, parsed1) if parsed1 else None
-            if coerced1:
-                _dbg(f"VOTE ACCEPTED ATTEMPT 1/json_object (voter={voter_model_id}) coerced/cleaned", coerced1)
-                return voter_model_id, content1, coerced1
-
-            # Attempt 1b: TEXT
-            try:
-                content1t = await call_model(
-                    session, base_url, voter_model_id, prompt1,
-                    temperature=0.0, sys_prompt=None, response_format=None
-                )
-            except Exception as e:
-                content1t = f"[ERROR during vote] {e}"
-
-            _dbg(f"VOTE raw OUTPUT ATTEMPT 1/text (voter={voter_model_id})", content1t)
-            parsed1t = None if (isinstance(content1t, str) and content1t.startswith("[ERROR")) else safe_load_vote_json(content1t)
-            if parsed1t and _has_placeholder_num(parsed1t):
-                parsed1t = None
-            coerced1t = coerce_and_clamp(idx_map_peer, parsed1t) if parsed1t else None
-            if coerced1t:
-                _dbg(f"VOTE ACCEPTED ATTEMPT 1/text (voter={voter_model_id}) coerced/cleaned", coerced1t)
-                return voter_model_id, content1t, coerced1t
-
-            # Attempt 1c: json_schema
-            schema = _build_voting_json_schema(RUBRIC)
-            try:
-                content1s = await call_model(
-                    session, base_url, voter_model_id, prompt1,
-                    temperature=0.0, sys_prompt=None,
-                    response_format={"type": "json_schema",
-                                     "json_schema": {"name": "vote_scores", "schema": schema}},
-                )
-            except Exception as e:
-                content1s = f"[ERROR during vote] {e}"
-
-            _dbg(f"VOTE raw OUTPUT ATTEMPT 1/json_schema (voter={voter_model_id})", content1s)
-            parsed1s = None if (isinstance(content1s, str) and content1s.startswith("[ERROR")) else safe_load_vote_json(content1s)
-            if parsed1s and _has_placeholder_num(parsed1s):
-                parsed1s = None
-            coerced1s = coerce_and_clamp(idx_map_peer, parsed1s) if parsed1s else None
-            if coerced1s:
-                _dbg(f"VOTE ACCEPTED ATTEMPT 1/json_schema (voter={voter_model_id}) coerced/cleaned", coerced1s)
-                return voter_model_id, content1s, coerced1s
-
-            # Attempt 2: strict mini prompt
-            prompt2 = strict_miniprompt(voter_model_id, idx_map_peer)
-            _dbg(f"VOTE prompt ATTEMPT 2 (voter={voter_model_id})", prompt2)
-
-            async def _try_with(mode: str):
-                rf = {"type":"json_object"} if mode=="json_object" else (None if mode=="text" else {"type":"json_schema","json_schema":{"name":"vote_scores","schema":schema}})
-                try:
-                    return await call_model(session, base_url, voter_model_id, prompt2, temperature=0.0, sys_prompt=None, response_format=rf)
-                except Exception as e:
-                    return f"[ERROR during vote] {e}"
-
-            for mode in ("json_object","text","json_schema"):
-                content2 = await _try_with(mode)
-                _dbg(f"VOTE raw OUTPUT ATTEMPT 2/{mode} (voter={voter_model_id})", content2)
-                parsed2 = None if (isinstance(content2, str) and content2.startswith("[ERROR")) else safe_load_vote_json(content2)
-                if parsed2 and _has_placeholder_num(parsed2):
-                    parsed2 = None
-                coerced2 = coerce_and_clamp(idx_map_peer, parsed2) if parsed2 else None
-                if coerced2:
-                    _dbg(f"VOTE ACCEPTED ATTEMPT 2/{mode} (voter={voter_model_id}) coerced/cleaned", coerced2)
-                    return voter_model_id, content2, coerced2
-
-            # Attempt 3: last resort with new session
-            try:
-                async with aiohttp.ClientSession() as tmp:
-                    content3 = await call_model(tmp, base_url, voter_model_id, prompt2, temperature=0.0, sys_prompt=None, response_format=None)
-            except Exception as e4:
-                content3 = f"[ERROR during vote] {e4}"
-
-            _dbg(f"VOTE raw OUTPUT ATTEMPT 3 (voter={voter_model_id})", content3)
-            parsed3 = None if (isinstance(content3, str) and content3.startswith("[ERROR")) else safe_load_vote_json(content3)
-            if parsed3 and _has_placeholder_num(parsed3):
-                parsed3 = None
-            coerced3 = coerce_and_clamp(idx_map_peer, parsed3) if parsed3 else None
-            if coerced3:
-                _dbg(f"VOTE ACCEPTED ATTEMPT 3 (voter={voter_model_id}) coerced/cleaned", coerced3)
-                return voter_model_id, content3, coerced3
-
-            # Deterministic neutral fallback
-            def base_score(mid: str) -> dict:
-                a = answers.get(mid, "")
-                if isinstance(a, str) and a.startswith("[ERROR"):
-                    return {"correctness": 0, "relevance": 0, "specificity": 0, "safety": 0, "conciseness": 0}
-                length_hint = min((len(a) // 200), RUBRIC["specificity"]) if isinstance(a, str) else 0
-                return {"correctness": 1, "relevance": 1, "specificity": length_hint, "safety": 1, "conciseness": 0}
-            fallback_scores = {mid: base_score(mid) for mid in peer_models}
-            _dbg(f"VOTE FALLBACK (voter={voter_model_id}) neutral scores", fallback_scores)
-            return voter_model_id, content3, {"scores": fallback_scores, "final_pick": None}
-
-        vote_triplets = await run_limited(max_concurrency, [lambda m=m: vote_one(m) for m in selected_models])
-        raw_votes = {m: raw for (m, raw, parsed) in vote_triplets}
-        parsed_votes = {m: parsed for (m, raw, parsed) in vote_triplets}
-
-        # Aggregate: sum(weighted scores) across voters for each candidate
-        def total_weighted(d: dict[str, int]) -> int:
-            return sum(d[k] * RUBRIC[k] for k in rubric_keys)
-
+                invalid_votes[voter_id] = msg
+        
+        # Report invalid ballots
+        if invalid_votes:
+            invalid_list = [short_id(m) for m in invalid_votes.keys()]
+            status_cb(f"⚠ {len(invalid_votes)}/{len(selected_models)} invalid ballots: {', '.join(invalid_list)}")
+        
+        _dbg("VALID VOTES", valid_votes)
+        _dbg("INVALID VOTES", invalid_votes)
+        
+        # Aggregate only valid votes
+        RUBRIC = {"correctness": 5, "relevance": 3, "specificity": 3, "safety": 2, "conciseness": 1}
         totals = {mid: 0 for mid in selected_models}
-        for voter, pack in parsed_votes.items():
-            # add rubric totals
-            for mid, score_dict in pack["scores"].items():
-                totals[mid] = totals.get(mid, 0) + total_weighted(score_dict)
-            # tiny tie-break/bonus for explicit final_pick
-            fp = pack.get("final_pick")
-            if isinstance(fp, int) and 1 <= fp <= (len(selected_models) - 1):
-                # build the 1..N map excluding self
+        
+        for voter, ballot in valid_votes.items():
+            for candidate_mid, score_dict in ballot["scores"].items():
+                weighted = sum(score_dict[k] * RUBRIC[k] for k in RUBRIC.keys())
+                totals[candidate_mid] = totals.get(candidate_mid, 0) + weighted
+        
+        # Add small bonus for explicit final_pick (tie-breaker)
+        for voter, ballot in valid_votes.items():
+            fp = ballot.get("final_pick")
+            if isinstance(fp, int):
                 peer_models = [m for m in selected_models if m != voter]
-                pick_map = {i+1: m for i, m in enumerate(peer_models)}
-                picked_mid = pick_map.get(fp)
-                if picked_mid:
+                if 1 <= fp <= len(peer_models):
+                    picked_mid = peer_models[fp - 1]
                     totals[picked_mid] = totals.get(picked_mid, 0) + 1
-
-        # CONSENSUS BONUS: identical normalized answers get a small lift
-        def _norm_answer(a: str) -> str:
-            return (a or "").strip().lower()
-
-        clusters = {}
-        for mid, ans in answers.items():
-            if isinstance(ans, str) and not ans.startswith("[ERROR"):
-                key = _norm_answer(ans)
-                clusters.setdefault(key, []).append(mid)
-
-        top_key, top_group = None, []
-        for k, group in clusters.items():
-            if k and len(group) > len(top_group):
-                top_key, top_group = k, group
-
-        if len(top_group) >= 2:
-            CONSENSUS_BONUS = 12
-            for mid in top_group:
-                totals[mid] = totals.get(mid, 0) + CONSENSUS_BONUS
-            _dbg("CONSENSUS BONUS applied", {"answer": top_key, "models": top_group, "bonus_each": CONSENSUS_BONUS})
-
-        # Consensus override: if a cluster of >=2 models gave the exact same non-refusal answer,
-        # prefer the highest-scoring within that cluster (stable by original order if tied).
-        def _is_refusal_text(ans: str) -> bool:
-            s = (ans or "").strip().lower()
-            return s.startswith("sorry") or s.startswith("i am sorry") or s.startswith("i’m sorry")
-        best_group = [mid for mid in top_group if answers.get(mid) and not _is_refusal_text(answers[mid])]
-        preferred_winner = None
-        if len(best_group) >= 2:
-            cluster_sorted = sorted(best_group, key=lambda m: (-totals.get(m, 0), selected_models.index(m)))
-            preferred_winner = cluster_sorted[0]
-            _dbg("CONSENSUS OVERRIDE winner", {"winner": preferred_winner, "group": best_group})
-
-
-        # Winner = max total among candidates (tie-break by original order)
-        top_total = max(totals.values()) if totals else -1
-        if top_total == 0:
-            status_cb("All voters produced zero-point totals; tie-break by model order.")
-        contenders = [m for m, t in totals.items() if t == top_total]
-        winner = preferred_winner or (sorted(contenders, key=lambda m: selected_models.index(m))[0] if contenders else selected_models[0])
-
-        # Coercion stats (simple heuristic)
-        def looks_like_neutral(sc: dict) -> bool:
-            return sc in ({"correctness":1,"relevance":1,"specificity":1,"safety":1,"conciseness":0},
-                          {"correctness":1,"relevance":1,"specificity":2,"safety":1,"conciseness":0})
-
-        coerced_count = 0
-        total_cells = 0
-        for voter, pack in parsed_votes.items():
-            for mid, sc in pack["scores"].items():
-                total_cells += 1
-                if looks_like_neutral(sc):
-                    coerced_count += 1
-
-        tally = totals  # points per candidate
-
+        
+        # Winner selection with clear tie-breaking
+        if not valid_votes:
+            status_cb("⚠ NO VALID VOTES - selecting first model by default")
+            winner = selected_models[0]
+            tally = totals
+        else:
+            max_score = max(totals.values())
+            contenders = [m for m, score in totals.items() if score == max_score]
+            
+            if len(contenders) > 1:
+                # Tie-break by position in selected_models (deterministic)
+                winner = min(contenders, key=lambda m: selected_models.index(m))
+                status_cb(f"Tie between {len(contenders)} models, selected by order: {short_id(winner)}")
+            else:
+                winner = contenders[0]
+            
+            tally = totals
+        
         _dbg("VOTE AGGREGATION — totals (points per candidate)", tally)
         _dbg("VOTE AGGREGATION — winner", winner)
-        _dbg("VOTE RAW OUTPUTS (per voter)", raw_votes)
-        _dbg("VOTE PARSED (per voter -> scores)", parsed_votes)
-
+        
         details = {
             "question": question,
             "answers": answers,
-            "raw_vote_outputs": raw_votes,
-            "votes": parsed_votes,
+            "valid_votes": valid_votes,
+            "invalid_votes": invalid_votes,
+            "vote_messages": vote_messages,
             "tally": tally,
             "errors": errors,
             "winner": winner,
-            "coerced_ratio": (coerced_count / total_cells) if total_cells else 0.0
+            "participation_rate": len(valid_votes) / len(selected_models) if selected_models else 0.0
         }
-        status_cb("Vote complete.")
+        
+        status_cb(f"Vote complete. Valid: {len(valid_votes)}/{len(selected_models)}")
         return answers, winner, details, tally
 
 # -----------------------
@@ -965,7 +854,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Council GUI — Qt")
+        self.setWindowTitle("PolyCouncil")
         self.resize(1320, 900)
 
         ensure_db()
@@ -1305,29 +1194,41 @@ class CouncilWindow(QtWidgets.QMainWindow):
         question, answers, winner, details, tally = payload
 
         # Per-model tabs: show each model's answer and the SCORES it received from each voter
-        raw_votes = details.get("votes", {})  # voter -> {"scores": {mid:{...}}, "final_pick": ...}
+        valid_votes = details.get("valid_votes", {})
+        invalid_votes = details.get("invalid_votes", {})
+        
         for m, a in answers.items():
             if m in self.model_texts:
                 received_lines = []
-                # show per-voter metrics or annotate when absent
-                for voter, pack in raw_votes.items():
-                    sc = details["votes"].get(voter, {}).get("scores", {}).get(m)
-                    if sc and any(sc.values()):
-                        # show weighted total too
+                # show per-voter metrics
+                for voter, ballot in valid_votes.items():
+                    sc = ballot.get("scores", {}).get(m)
+                    if sc:
+                        # show weighted total
                         weighted = sc["correctness"]*5 + sc["relevance"]*3 + sc["specificity"]*3 + sc["safety"]*2 + sc["conciseness"]*1
                         received_lines.append(f"{short_id(voter)}: {sc} → total {weighted}")
-                    else:
-                        received_lines.append(f"{short_id(voter)}: no scores for this answer")
-                        scores_text = "\n".join(received_lines) if received_lines else "No scores received."
-                        display = f"{a}\n\n---\nVotes cast for this answer:\n{scores_text}"
-                    self.model_texts[m].setPlainText(display)
+                
+                scores_text = "\n".join(received_lines) if received_lines else "No valid scores received for this answer."
+                
+                # Add reasoning if available
+                reasoning_lines = []
+                for voter, ballot in valid_votes.items():
+                    fp = ballot.get("final_pick")
+                    reasoning = ballot.get("reasoning", "")
+                    if reasoning:
+                        reasoning_lines.append(f"{short_id(voter)}: {reasoning}")
+                
+                reasoning_text = "\n".join(reasoning_lines) if reasoning_lines else ""
+                
+                display = f"{a}\n\n---\nVotes received:\n{scores_text}"
+                if reasoning_text:
+                    display += f"\n\nVoter reasoning:\n{reasoning_text}"
+                
+                self.model_texts[m].setPlainText(display)
 
-        coerced_ratio = float(details.get("coerced_ratio", 0.0))
-        if coerced_ratio > 0.40:
-            self._append_chat(f"[Note] Many judge scores resembled neutral fallbacks ({coerced_ratio:.0%}). "
-                              f"Consider limiting voters to stronger models or enabling a single judge.\n")
-
-        num_voters = len(raw_votes)
+        participation_rate = details.get("participation_rate", 0.0)
+        num_voters = len(valid_votes)
+        
         votes_line = ", ".join(
             f"{short_id(k)}:{v}"
             for k, v in sorted(tally.items(), key=lambda x: -x[1])
@@ -1339,12 +1240,21 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
         winner_display = short_id(winner)
         win_text = answers.get(winner, "")
-        self._append_chat(
+        
+        result_text = (
             f"Winner: {winner_display}\n"
+            f"Valid votes: {len(valid_votes)}/{len(answers)} ({participation_rate:.0%})\n"
             f"Total points → {votes_line or 'n/a'}\n"
             f"Avg points (per voter) → {avg_line}\n"
-            f"{win_text}\n"
         )
+        
+        if invalid_votes:
+            invalid_list = [short_id(m) for m in invalid_votes.keys()]
+            result_text += f"⚠ Invalid ballots from: {', '.join(invalid_list)}\n"
+        
+        result_text += f"\n{win_text}\n"
+        
+        self._append_chat(result_text)
         self._refresh_leaderboard()
         self._set_status("Ready.")
 
