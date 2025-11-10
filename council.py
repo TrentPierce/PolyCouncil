@@ -57,18 +57,18 @@ def load_settings() -> dict:
             return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return {"base_url": "http://localhost:1234", "debug": False}
+    return {"base_url": "http://localhost:1234", "single_voter_enabled": False, "single_voter_model": ""}
 
 def save_settings(s: dict):
     try:
-        current = {}
+        cur = {}
         if SETTINGS_PATH.exists():
             try:
-                current = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+                cur = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
             except Exception:
-                current = {}
-        current.update(s)
-        SETTINGS_PATH.write_text(json.dumps(current, indent=2), encoding="utf-8")
+                cur = {}
+        cur.update(s)
+        SETTINGS_PATH.write_text(json.dumps(cur, indent=2), encoding="utf-8")
     except Exception:
         pass
 
@@ -742,7 +742,8 @@ async def council_round(
     question: str,
     roles: Dict[str, Optional[str]],
     status_cb,
-    max_concurrency: int = 1
+    max_concurrency: int = 1,
+    voter_override: Optional[List[str]] = None
 ):
     status_cb("Collecting answers…")
     async with aiohttp.ClientSession() as session:
@@ -773,7 +774,7 @@ async def council_round(
         vote_results = await run_limited(
             max_concurrency,
             [lambda m=m: vote_one_improved(session, base_url, m, question, answers, selected_models) 
-             for m in selected_models]
+             for m in (voter_override if voter_override else selected_models)]
         )
         
         # Separate valid and invalid ballots
@@ -877,14 +878,16 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
         # restore base URL
         self.base_edit.setText(CURRENT_BASE)
-        # restore debug setting
+        # restore single-voter
         try:
             s = load_settings()
-            self.debug_check.setChecked(bool(s.get("debug", False)))
+            self.single_voter_check.setChecked(bool(s.get("single_voter_enabled", False)))
+            sel = s.get("single_voter_model", "") or ""
+            if sel:
+                self.single_voter_combo.addItem(sel)
+                self.single_voter_combo.setCurrentText(sel)
         except Exception:
-            self.debug_check.setChecked(False)
-        global DEBUG_VOTING
-        DEBUG_VOTING = self.debug_check.isChecked()
+            pass
         self._connect_base()
 
         self._refresh_leaderboard()
@@ -906,7 +909,9 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.connect_btn = QtWidgets.QPushButton("Connect")
 
         self.roles_check = QtWidgets.QCheckBox("Enable personas (answers only)")
-        self.debug_check = QtWidgets.QCheckBox("Debug logs")
+        self.single_voter_check = QtWidgets.QCheckBox("Single-voter")
+        self.single_voter_combo = QtWidgets.QComboBox()
+        self.single_voter_combo.setMinimumWidth(220)
 
         # Concurrency controls + warning on the RIGHT
         self.conc_label = QtWidgets.QLabel("Max concurrent jobs:")
@@ -928,7 +933,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
         top.addWidget(self.base_edit, stretch=0)
         top.addWidget(self.connect_btn)
         top.addWidget(self.roles_check)
-        top.addWidget(self.debug_check)
+        top.addWidget(self.single_voter_check)
+        top.addWidget(self.single_voter_combo)
         top.addStretch(1)
         top.addLayout(conc_box)
 
@@ -1048,7 +1054,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.send_btn.clicked.connect(self._send)
         self.prompt_edit.returnPressed.connect(self._send)
         self.roles_check.stateChanged.connect(self._roles_toggled)
-        self.debug_check.stateChanged.connect(self._debug_toggled)
+        self.single_voter_check.stateChanged.connect(self._single_voter_toggled)
+        self.single_voter_combo.currentTextChanged.connect(self._single_voter_changed)
 
         self.status_signal.connect(self._set_status)
         self.result_signal.connect(self._handle_result)
@@ -1056,13 +1063,15 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.done_signal.connect(self._done)
 
     # ----- actions -----
+    def _single_voter_toggled(self, state):
+        enabled = (state == QtCore.Qt.CheckState.Checked)
+        save_settings({"single_voter_enabled": enabled, "single_voter_model": self.single_voter_combo.currentText()})
+
+    def _single_voter_changed(self, text: str):
+        save_settings({"single_voter_model": text})
+
     def _roles_toggled(self, state):
         self.use_roles = (state == QtCore.Qt.CheckState.Checked)
-
-    def _debug_toggled(self, state):
-        global DEBUG_VOTING
-        DEBUG_VOTING = (state == QtCore.Qt.CheckState.Checked)
-        save_settings({"debug": DEBUG_VOTING})
 
     def _connect_base(self):
         global CURRENT_BASE, MODEL_READY
@@ -1114,6 +1123,20 @@ class CouncilWindow(QtWidgets.QMainWindow):
             cb.stateChanged.connect(self._checkbox_toggled)
             self.models_layout.insertWidget(self.models_layout.count()-1, cb)
             self.model_checks[m] = cb
+            # keep single-voter dropdown synced with available models
+            try:
+                self.single_voter_combo.blockSignals(True)
+                self.single_voter_combo.clear()
+                for _mid in self.models:
+                    self.single_voter_combo.addItem(_mid)
+                last = load_settings().get("single_voter_model", "")
+                if last:
+                    ix = self.single_voter_combo.findText(last)
+                    if ix >= 0:
+                        self.single_voter_combo.setCurrentIndex(ix)
+            finally:
+                self.single_voter_combo.blockSignals(False)
+
 
         for m in pre:
             MODEL_READY[m] = True
@@ -1165,8 +1188,21 @@ class CouncilWindow(QtWidgets.QMainWindow):
                     return
 
                 self._queue_status("Starting council …")
+                                # Sync single-voter dropdown with the current selected models
+                try:
+                    self.single_voter_combo.blockSignals(True)
+                    self.single_voter_combo.clear()
+                    for _mid in selected:
+                        self.single_voter_combo.addItem(_mid)
+                    last = load_settings().get("single_voter_model", "")
+                    if last:
+                        ix = self.single_voter_combo.findText(last)
+                        if ix >= 0:
+                            self.single_voter_combo.setCurrentIndex(ix)
+                finally:
+                    self.single_voter_combo.blockSignals(False)
                 answers, winner, details, tally = asyncio.run(
-                    council_round(CURRENT_BASE, selected, question, roles, self._queue_status, max_concurrency=maxc)
+                    council_round(CURRENT_BASE, selected, question, roles, self._queue_status, max_concurrency=maxc, voter_override=( [self.single_voter_combo.currentText().strip()] if self.single_voter_check.isChecked() else None ))
                 )
                 record_vote(question, winner, details)
                 self.result_signal.emit((question, answers, winner, details, tally))
