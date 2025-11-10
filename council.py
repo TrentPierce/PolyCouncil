@@ -57,11 +57,18 @@ def load_settings() -> dict:
             return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return {"base_url": "http://localhost:1234"}
+    return {"base_url": "http://localhost:1234", "debug": False}
 
 def save_settings(s: dict):
     try:
-        SETTINGS_PATH.write_text(json.dumps(s, indent=2), encoding="utf-8")
+        current = {}
+        if SETTINGS_PATH.exists():
+            try:
+                current = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                current = {}
+        current.update(s)
+        SETTINGS_PATH.write_text(json.dumps(current, indent=2), encoding="utf-8")
     except Exception:
         pass
 
@@ -870,6 +877,14 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
         # restore base URL
         self.base_edit.setText(CURRENT_BASE)
+        # restore debug setting
+        try:
+            s = load_settings()
+            self.debug_check.setChecked(bool(s.get("debug", False)))
+        except Exception:
+            self.debug_check.setChecked(False)
+        global DEBUG_VOTING
+        DEBUG_VOTING = self.debug_check.isChecked()
         self._connect_base()
 
         self._refresh_leaderboard()
@@ -891,6 +906,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.connect_btn = QtWidgets.QPushButton("Connect")
 
         self.roles_check = QtWidgets.QCheckBox("Enable personas (answers only)")
+        self.debug_check = QtWidgets.QCheckBox("Debug logs")
 
         # Concurrency controls + warning on the RIGHT
         self.conc_label = QtWidgets.QLabel("Max concurrent jobs:")
@@ -912,6 +928,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
         top.addWidget(self.base_edit, stretch=0)
         top.addWidget(self.connect_btn)
         top.addWidget(self.roles_check)
+        top.addWidget(self.debug_check)
         top.addStretch(1)
         top.addLayout(conc_box)
 
@@ -1031,6 +1048,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.send_btn.clicked.connect(self._send)
         self.prompt_edit.returnPressed.connect(self._send)
         self.roles_check.stateChanged.connect(self._roles_toggled)
+        self.debug_check.stateChanged.connect(self._debug_toggled)
 
         self.status_signal.connect(self._set_status)
         self.result_signal.connect(self._handle_result)
@@ -1040,6 +1058,11 @@ class CouncilWindow(QtWidgets.QMainWindow):
     # ----- actions -----
     def _roles_toggled(self, state):
         self.use_roles = (state == QtCore.Qt.CheckState.Checked)
+
+    def _debug_toggled(self, state):
+        global DEBUG_VOTING
+        DEBUG_VOTING = (state == QtCore.Qt.CheckState.Checked)
+        save_settings({"debug": DEBUG_VOTING})
 
     def _connect_base(self):
         global CURRENT_BASE, MODEL_READY
