@@ -1,3 +1,47 @@
 {
-  "base_url": "http://localhost:1234"
+  "base_url": "http://localhost:1234",
+  "single_voter_enabled": false,
+  "single_voter_model": "",
+  "roles_enabled": true,
+  "persona_template": "None",
+  "personas": [
+    {
+      "name": "None",
+      "prompt": null,
+      "builtin": true
+    },
+    {
+      "name": "Cautious risk assessor",
+      "prompt": "You are a cautious risk assessor. Identify failure modes and propose mitigations.",
+      "builtin": true
+    },
+    {
+      "name": "Clear teacher",
+      "prompt": "You are a clear teacher. Explain concepts simply with short examples where helpful.",
+      "builtin": true
+    },
+    {
+      "name": "Data analyst",
+      "prompt": "You are a data analyst. Structure answers into bullets, highlight assumptions and limits.",
+      "builtin": true
+    },
+    {
+      "name": "Meticulous fact-checker",
+      "prompt": "You are a meticulous fact-checker. Prefer primary sources and verify each claim.",
+      "builtin": true
+    },
+    {
+      "name": "Pragmatic engineer",
+      "prompt": "You are a pragmatic engineer. Focus on feasible steps, tradeoffs, and edge cases.",
+      "builtin": true
+    },
+    {
+      "name": "Systems thinker",
+      "prompt": "You are a systems thinker. Map long-term interactions and consequences.",
+      "builtin": true
+    },
+  ],
+  "persona_assignments": {
+    
+  }
 }
