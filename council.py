@@ -29,6 +29,18 @@ except Exception:
 # -----------------------
 DEBUG_VOTING = True                 # set False to silence
 LOG_TRUNCATE: Optional[int] = None  # e.g., 8000 to cap output, or None for full
+LOG_SINK: Optional[Callable[[str, str], None]] = None
+
+DEFAULT_PERSONAS: List[dict] = [
+    {"name": "None", "prompt": None, "builtin": True},
+    {"name": "Meticulous fact-checker", "prompt": "You are a meticulous fact-checker. Prefer primary sources and verify each claim.", "builtin": True},
+    {"name": "Pragmatic engineer", "prompt": "You are a pragmatic engineer. Focus on feasible steps, tradeoffs, and edge cases.", "builtin": True},
+    {"name": "Cautious risk assessor", "prompt": "You are a cautious risk assessor. Identify failure modes and propose mitigations.", "builtin": True},
+    {"name": "Clear teacher", "prompt": "You are a clear teacher. Explain concepts simply with short examples where helpful.", "builtin": True},
+    {"name": "Data analyst", "prompt": "You are a data analyst. Structure answers into bullets, highlight assumptions and limits.", "builtin": True},
+    {"name": "Systems thinker", "prompt": "You are a systems thinker. Map long-term interactions and consequences.", "builtin": True},
+]
+
 
 def _dbg(label: str, text: Any):
     if not DEBUG_VOTING:
@@ -42,7 +54,76 @@ def _dbg(label: str, text: Any):
         s = str(text)
     if LOG_TRUNCATE and len(s) > LOG_TRUNCATE:
         s = s[:LOG_TRUNCATE] + f"\n...[truncated {len(s) - LOG_TRUNCATE} chars]"
+    if LOG_SINK:
+        try:
+            LOG_SINK(label, s)
+        except Exception:
+            pass
     print(f"\n===== {label} =====\n{s}\n", flush=True)
+
+
+def set_log_sink(callback: Optional[Callable[[str, str], None]]):
+    global LOG_SINK
+    LOG_SINK = callback
+
+def create_app_icon(size: int = 256) -> QtGui.QIcon:
+    size = max(64, int(size))
+    pixmap = QtGui.QPixmap(size, size)
+    pixmap.fill(QtCore.Qt.transparent)
+
+    painter = QtGui.QPainter(pixmap)
+    painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+    bg_color = QtGui.QColor("#1f80d6")
+    radius = size * 0.2
+    bg_path = QtGui.QPainterPath()
+    bg_path.addRoundedRect(QtCore.QRectF(0, 0, size, size), radius, radius)
+    painter.fillPath(bg_path, bg_color)
+
+    stripe_color = QtGui.QColor(255, 255, 255, 220)
+    stripe_width = size * 0.08
+    stripe_length = size * 0.38
+    stripe_start_x = size * 0.14
+    stripe_start_y = size * 0.34
+    stripe_gap = stripe_width * 0.8
+    painter.setBrush(stripe_color)
+    painter.setPen(QtCore.Qt.NoPen)
+    for i in range(3):
+        rect = QtCore.QRectF(
+            stripe_start_x,
+            stripe_start_y + i * (stripe_width + stripe_gap),
+            stripe_length,
+            stripe_width,
+        )
+        painter.drawRoundedRect(rect, stripe_width * 0.5, stripe_width * 0.5)
+
+    bubble_rect = QtCore.QRectF(size * 0.36, size * 0.26, size * 0.48, size * 0.46)
+    bubble_path = QtGui.QPainterPath()
+    bubble_path.addRoundedRect(bubble_rect, size * 0.12, size * 0.12)
+
+    tail = QtGui.QPolygonF(
+        [
+            QtCore.QPointF(bubble_rect.left() + bubble_rect.width() * 0.18, bubble_rect.bottom()),
+            QtCore.QPointF(bubble_rect.left() + bubble_rect.width() * 0.36, bubble_rect.bottom()),
+            QtCore.QPointF(bubble_rect.left() + bubble_rect.width() * 0.26, bubble_rect.bottom() + size * 0.12),
+        ]
+    )
+    bubble_path.addPolygon(tail)
+    painter.fillPath(bubble_path, QtGui.QColor("white"))
+
+    check_pen = QtGui.QPen(bg_color, size * 0.085, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin)
+    painter.setPen(check_pen)
+    check_points = QtGui.QPolygonF(
+        [
+            QtCore.QPointF(bubble_rect.left() + bubble_rect.width() * 0.18, bubble_rect.center().y()),
+            QtCore.QPointF(bubble_rect.left() + bubble_rect.width() * 0.38, bubble_rect.bottom() - bubble_rect.height() * 0.18),
+            QtCore.QPointF(bubble_rect.right() - bubble_rect.width() * 0.18, bubble_rect.top() + bubble_rect.height() * 0.24),
+        ]
+    )
+    painter.drawPolyline(check_points)
+
+    painter.end()
+    return QtGui.QIcon(pixmap)
 
 def short_id(mid: str, n: int = 28) -> str:
     try:
@@ -71,7 +152,11 @@ def load_settings() -> dict:
         "base_url": "http://localhost:1234",
         "debug": False,
         "single_voter_enabled": False,
-        "single_voter_model": ""
+        "single_voter_model": "",
+        "max_concurrency": 1,
+        "roles_enabled": False,
+        "personas": [],
+        "persona_assignments": {},
     }
 
 def save_settings(s: dict):
@@ -484,15 +569,41 @@ async def council_round(
 # -----------------------
 # Qt GUI
 # -----------------------
+class ModelFetchWorker(QtCore.QObject):
+    finished = QtCore.Signal(list)
+    failed = QtCore.Signal(str)
+
+    def __init__(self, base_url: str):
+        super().__init__()
+        self.base_url = base_url
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            models = fetch_models_from_lmstudio(self.base_url)
+            self.finished.emit(models)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 class CouncilWindow(QtWidgets.QMainWindow):
     status_signal = QtCore.Signal(str)
     result_signal = QtCore.Signal(object)   # (question, answers, winner, details, tally)
     error_signal  = QtCore.Signal(str)
+    log_signal    = QtCore.Signal(str)
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PolyCouncil")
         self.resize(1320, 900)
+        self.app_icon = create_app_icon()
+        self.setWindowIcon(self.app_icon)
+
+        self.use_roles = False
+        self.debug_enabled = False
+        self._model_thread: Optional[QtCore.QThread] = None
+        self._model_worker: Optional[ModelFetchWorker] = None
+        self.log_history_limit = 500
 
         if qdarktheme:
             try:
@@ -506,25 +617,45 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.model_checks: Dict[str, QtWidgets.QCheckBox] = {}
         self.model_tabs: Dict[str, QtWidgets.QWidget] = {}
         self.model_texts: Dict[str, QtWidgets.QPlainTextEdit] = {}
+        self.model_persona_combos: Dict[str, QtWidgets.QComboBox] = {}
 
         self._build_ui()
+        self._setup_log_dock()
         self._connect_signals()
+        set_log_sink(self._log_sink_dispatch)
 
         # restore settings
         s = load_settings()
         self.base_edit.setText(s.get("base_url", "http://localhost:1234"))
-        self.debug_check.setChecked(bool(s.get("debug", False)))
+
+        self.personas = self._merge_persona_library(s.get("personas", []))
+        self.persona_assignments: Dict[str, str] = dict(s.get("persona_assignments", {}) or {})
+        self._cleanup_persona_assignments()
+
+        self.debug_enabled = bool(s.get("debug", False))
+        self._apply_debug_setting(self.debug_enabled, persist=False, announce=True)
+
+        self.single_voter_check.blockSignals(True)
         self.single_voter_check.setChecked(bool(s.get("single_voter_enabled", False)))
+        self.single_voter_check.blockSignals(False)
+
         sel = s.get("single_voter_model", "") or ""
         if sel and self.single_voter_combo.findText(sel) < 0:
             self.single_voter_combo.addItem(sel)
         if sel:
             self.single_voter_combo.setCurrentText(sel)
 
-        global DEBUG_VOTING
-        DEBUG_VOTING = self.debug_check.isChecked()
-        # reflect the restored state in the status bar
-        self._set_status(f"Debug logs: {'ON' if DEBUG_VOTING else 'OFF'}")
+        # Load roles_enabled setting (will be shown in settings dialog)
+        roles_enabled = bool(s.get("roles_enabled", False))
+        self.use_roles = roles_enabled
+        # Update visibility if models are already loaded
+        if hasattr(self, 'model_persona_combos') and self.model_persona_combos:
+            self._update_persona_combo_visibility()
+
+        self.conc_spin.blockSignals(True)
+        saved_conc = int(s.get("max_concurrency", 1) or 1)
+        self.conc_spin.setValue(max(1, min(saved_conc, self.conc_spin.maximum())))
+        self.conc_spin.blockSignals(False)
 
         # initial connect
         QtCore.QTimer.singleShot(50, self._connect_base)
@@ -538,6 +669,21 @@ class CouncilWindow(QtWidgets.QMainWindow):
         layout.setSpacing(8)
         self.setCentralWidget(central)
 
+        # Navigation bar
+        nav = QtWidgets.QHBoxLayout()
+        nav.setSpacing(10)
+        nav.setContentsMargins(0, 0, 0, 0)
+        title = QtWidgets.QLabel("PolyCouncil")
+        t_font = title.font()
+        t_font.setPointSize(t_font.pointSize() + 2)
+        t_font.setBold(True)
+        title.setFont(t_font)
+        self.settings_btn = QtWidgets.QPushButton("Settings")
+        nav.addWidget(title)
+        nav.addStretch(1)
+        nav.addWidget(self.settings_btn)
+        layout.addLayout(nav)
+
         # Top Bar (classic look + added single-voter widgets)
         top = QtWidgets.QHBoxLayout()
         top.setSpacing(10)
@@ -545,9 +691,6 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.base_edit = QtWidgets.QLineEdit()
         self.base_edit.setPlaceholderText("http://localhost:1234")
         self.connect_btn = QtWidgets.QPushButton("Connect")
-
-        self.roles_check = QtWidgets.QCheckBox("Enable personas (answers only)")
-        self.debug_check = QtWidgets.QCheckBox("Debug logs")
 
         # Single voter controls
         self.single_voter_check = QtWidgets.QCheckBox("Single-voter")
@@ -572,8 +715,6 @@ class CouncilWindow(QtWidgets.QMainWindow):
         top.addWidget(QtWidgets.QLabel("LM Studio Base URL:"))
         top.addWidget(self.base_edit, stretch=0)
         top.addWidget(self.connect_btn)
-        top.addWidget(self.roles_check)
-        top.addWidget(self.debug_check)
         top.addWidget(self.single_voter_check)
         top.addWidget(self.single_voter_combo)
         top.addStretch(1)
@@ -603,9 +744,11 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
         self.models_area = QtWidgets.QScrollArea()
         self.models_area.setWidgetResizable(True)
+        self.models_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.models_inner = QtWidgets.QWidget()
         self.models_layout = QtWidgets.QVBoxLayout(self.models_inner)
         self.models_layout.setContentsMargins(6,6,6,6)
+        self.models_layout.setSpacing(4)
         self.models_layout.addStretch(1)
         self.models_area.setWidget(self.models_inner)
 
@@ -627,7 +770,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
         left_widget = QtWidgets.QWidget()
         left_widget.setLayout(left)
-        left_widget.setMinimumWidth(320)
+        left_widget.setMinimumWidth(420)  # Increased to accommodate persona buttons
         grid.addWidget(left_widget, 0, 0)
 
         # Center: Chat
@@ -686,6 +829,18 @@ class CouncilWindow(QtWidgets.QMainWindow):
         bottom.addWidget(self.footer_link, stretch=0)
         layout.addLayout(bottom)
 
+    def _setup_log_dock(self):
+        self.log_view = QtWidgets.QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(self.log_history_limit)
+        self.log_dock = QtWidgets.QDockWidget("Debug Log", self)
+        self.log_dock.setWidget(self.log_view)
+        self.log_dock.setAllowedAreas(
+            QtCore.Qt.BottomDockWidgetArea | QtCore.Qt.RightDockWidgetArea
+        )
+        self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self.log_dock)
+        self.log_dock.hide()
+
     def _connect_signals(self):
         self.connect_btn.clicked.connect(self._connect_base)
         self.refresh_models_btn.clicked.connect(self._refresh_models_clicked)
@@ -694,8 +849,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.reset_btn.clicked.connect(self._reset_leaderboard_clicked)
         self.send_btn.clicked.connect(self._send)
         self.prompt_edit.returnPressed.connect(self._send)
-        self.roles_check.stateChanged.connect(self._roles_toggled)
-        self.debug_check.toggled.connect(self._debug_toggled)
+        self.conc_spin.valueChanged.connect(self._concurrency_changed)
+        self.settings_btn.clicked.connect(self._open_settings_dialog)
 
         # single-voter signals (make sure message shows correct ON/OFF)
         self.single_voter_check.toggled.connect(self._single_voter_toggled_bool)
@@ -704,16 +859,403 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.status_signal.connect(self._set_status)
         self.result_signal.connect(self._handle_result)
         self.error_signal.connect(self._handle_error)
+        self.log_signal.connect(self._append_log)
 
     # ----- actions -----
-    def _roles_toggled(self, state):
-        self.use_roles = (state == QtCore.Qt.CheckState.Checked)
+    def _update_persona_combo_visibility(self):
+        """Update visibility and enabled state of persona buttons - show and enable when personas are enabled"""
+        if not hasattr(self, 'model_persona_combos') or not self.model_persona_combos:
+            return
+        
+        # Show buttons only when personas are enabled
+        enabled = bool(self.use_roles)
+        for model, btn in list(self.model_persona_combos.items()):
+            if not btn or not isinstance(btn, QtWidgets.QPushButton):
+                continue
+            # Show buttons when personas are enabled, hide when disabled
+            btn.setVisible(enabled)
+            btn.setEnabled(enabled)
+            # Update button style
+            if enabled:
+                btn.setStyleSheet("")
+            else:
+                btn.setStyleSheet("QPushButton { color: #888; background-color: #333; }")
+        
+        # Force layout update
+        if hasattr(self, 'models_inner') and self.models_inner:
+            self.models_inner.updateGeometry()
+            self.models_area.update()
+    
+    def _show_persona_menu(self, model_id: str, button: QtWidgets.QPushButton):
+        """Show persona selection menu for a model"""
+        if not self.use_roles:
+            return
+        # Create menu dynamically
+        menu = QtWidgets.QMenu(self)
+        current_assigned = self.persona_assignments.get(model_id, "None")
+        persona_list = self._persona_names()
+        for persona_name in persona_list:
+            action = menu.addAction(persona_name)
+            action.setCheckable(True)
+            if persona_name == current_assigned:
+                action.setChecked(True)
+            # Use a closure that captures the values correctly
+            def make_action_handler(pn, mid, btn):
+                return lambda checked: self._select_persona_for_model(mid, pn, btn)
+            action.triggered.connect(make_action_handler(persona_name, model_id, button))
+        # Show menu below button
+        button_pos = button.mapToGlobal(button.rect().bottomLeft())
+        menu.exec(button_pos)
+    
+    def _select_persona_for_model(self, model: str, persona_name: str, button: QtWidgets.QPushButton):
+        """Handle persona selection for a specific model"""
+        if persona_name not in self._persona_names():
+            persona_name = "None"
+        self.persona_assignments[model] = persona_name
+        
+        # Update button text (truncate if too long)
+        display_text = persona_name if persona_name != "None" else "Persona"
+        if len(display_text) > 12:
+            display_text = display_text[:10] + ".."
+        button.setText(display_text)
+        button.setToolTip(persona_name if persona_name != "None" else "Select persona")
+        
+        self._save_persona_state()
+        
+        # Update the menu to show the selected persona
+        menu = button.menu()
+        if menu:
+            for action in menu.actions():
+                action.setChecked(action.text() == persona_name)
 
     def _debug_toggled(self, checked: bool):
+        self._apply_debug_setting(bool(checked), persist=True, announce=True)
+
+    def _apply_debug_setting(self, enabled: bool, *, persist: bool, announce: bool):
+        self.debug_enabled = bool(enabled)
         global DEBUG_VOTING
-        DEBUG_VOTING = bool(checked)
-        save_settings({"debug": DEBUG_VOTING})
-        self._set_status(f"Debug logs: {'ON' if DEBUG_VOTING else 'OFF'}")
+        DEBUG_VOTING = self.debug_enabled
+        if persist:
+            save_settings({"debug": self.debug_enabled})
+        if hasattr(self, "log_dock"):
+            if not self.debug_enabled:
+                self.log_dock.hide()
+            elif self.log_view.blockCount():
+                self.log_dock.show()
+        if announce:
+            self._set_status(f"Debug logs: {'ON' if self.debug_enabled else 'OFF'}")
+
+    def _merge_persona_library(self, stored: Iterable[dict]) -> List[dict]:
+        library: Dict[str, dict] = {}
+        for persona in DEFAULT_PERSONAS:
+            library[persona["name"]] = dict(persona)
+        for entry in stored or []:
+            name = entry.get("name")
+            if not name:
+                continue
+            entry_prompt = entry.get("prompt")
+            entry_builtin = bool(entry.get("builtin", False))
+            if name in library and library[name].get("builtin"):
+                # keep builtin prompt for defaults
+                continue
+            library[name] = {
+                "name": str(name),
+                "prompt": entry_prompt if entry_prompt is not None else None,
+                "builtin": entry_builtin,
+            }
+
+        personas = list(library.values())
+
+        def sort_key(persona: dict) -> tuple[int, str]:
+            if persona["name"] == "None":
+                return (0, "")
+            return (
+                1 if persona.get("builtin", False) else 2,
+                persona["name"].lower(),
+            )
+
+        personas.sort(key=sort_key)
+        return personas
+
+    def _sort_personas_inplace(self):
+        def sort_key(persona: dict) -> tuple[int, str]:
+            if persona["name"] == "None":
+                return (0, "")
+            return (
+                1 if persona.get("builtin", False) else 2,
+                persona["name"].lower(),
+            )
+
+        self.personas.sort(key=sort_key)
+
+    def _persona_names(self) -> List[str]:
+        return [persona["name"] for persona in self.personas]
+
+    def _persona_prompt(self, name: str) -> Optional[str]:
+        for persona in self.personas:
+            if persona["name"] == name:
+                return persona.get("prompt")
+        return None
+
+    def _persona_by_name(self, name: str) -> Optional[dict]:
+        for persona in self.personas:
+            if persona["name"] == name:
+                return persona
+        return None
+
+    def _cleanup_persona_assignments(self):
+        names = set(self._persona_names())
+        dirty = False
+        for model, persona_name in list(self.persona_assignments.items()):
+            if persona_name not in names:
+                self.persona_assignments[model] = "None"
+                dirty = True
+        if dirty:
+            self._save_persona_state()
+
+    def _save_persona_state(self):
+        save_settings({
+            "personas": self.personas,
+            "persona_assignments": self.persona_assignments,
+        })
+
+    def _refresh_persona_combos(self):
+        """Refresh persona button text for all model buttons"""
+        names = self._persona_names()
+        if not names:
+            # Ensure at least "None" exists
+            if not hasattr(self, 'personas') or not self.personas:
+                self.personas = [{"name": "None", "prompt": None, "builtin": True}]
+            names = ["None"]
+        
+        self._cleanup_persona_assignments()
+        for model, btn in self.model_persona_combos.items():
+            if not btn or not isinstance(btn, QtWidgets.QPushButton):
+                continue
+            assigned = self.persona_assignments.get(model, "None")
+            if assigned not in names:
+                assigned = "None"
+            
+            # Update button text
+            display_text = assigned if assigned != "None" else "Persona"
+            if len(display_text) > 12:
+                display_text = display_text[:10] + ".."
+            btn.setText(display_text)
+            btn.setToolTip(assigned if assigned != "None" else "Select persona")
+
+    def _persona_assigned(self, model: str, persona_name: str):
+        if persona_name not in self._persona_names():
+            persona_name = "None"
+        self.persona_assignments[model] = persona_name
+        self._save_persona_state()
+
+    def _concurrency_changed(self, value: int):
+        save_settings({"max_concurrency": int(value)})
+
+    def _open_settings_dialog(self):
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Settings")
+        dialog.resize(700, 600)
+        layout = QtWidgets.QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        # Debug section
+        debug_checkbox = QtWidgets.QCheckBox("Enable debug logs")
+        debug_checkbox.setChecked(self.debug_enabled)
+        layout.addWidget(debug_checkbox)
+        
+        # Enable personas section
+        enable_personas_checkbox = QtWidgets.QCheckBox("Enable personas")
+        enable_personas_checkbox.setChecked(self.use_roles)
+        layout.addWidget(enable_personas_checkbox)
+
+        # Persona management section
+        persona_group = QtWidgets.QGroupBox("Persona Management")
+        persona_layout = QtWidgets.QVBoxLayout(persona_group)
+        persona_layout.setSpacing(8)
+
+        # Persona list
+        persona_list_label = QtWidgets.QLabel("Available Personas:")
+        persona_layout.addWidget(persona_list_label)
+
+        persona_list = QtWidgets.QListWidget()
+        persona_list.setMaximumHeight(200)
+        for persona in self.personas:
+            item = QtWidgets.QListWidgetItem(persona["name"])
+            if persona.get("builtin", False):
+                item.setForeground(QtGui.QColor("#666"))
+            persona_list.addItem(item)
+        persona_layout.addWidget(persona_list)
+
+        # Persona buttons
+        persona_btn_layout = QtWidgets.QHBoxLayout()
+        add_persona_btn = QtWidgets.QPushButton("Add Custom Persona")
+        edit_persona_btn = QtWidgets.QPushButton("Edit Selected")
+        delete_persona_btn = QtWidgets.QPushButton("Delete Selected")
+        persona_btn_layout.addWidget(add_persona_btn)
+        persona_btn_layout.addWidget(edit_persona_btn)
+        persona_btn_layout.addWidget(delete_persona_btn)
+        persona_layout.addLayout(persona_btn_layout)
+
+        layout.addWidget(persona_group)
+
+        # Report issue button
+        report_btn = QtWidgets.QPushButton("Report an Issue")
+        layout.addWidget(report_btn)
+
+        layout.addStretch(1)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        layout.addWidget(buttons)
+
+        # Connect signals
+        report_btn.clicked.connect(
+            lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl("https://github.com/TrentPierce/PolyCouncil/issues"))
+        )
+        debug_checkbox.toggled.connect(self._debug_toggled)
+        
+        def on_personas_toggled(checked):
+            self.use_roles = checked
+            save_settings({"roles_enabled": self.use_roles})
+            self._update_persona_combo_visibility()
+            QtWidgets.QApplication.processEvents()
+        
+        enable_personas_checkbox.toggled.connect(on_personas_toggled)
+        buttons.rejected.connect(dialog.reject)
+
+        def refresh_persona_list():
+            persona_list.clear()
+            for persona in self.personas:
+                item = QtWidgets.QListWidgetItem(persona["name"])
+                if persona.get("builtin", False):
+                    item.setForeground(QtGui.QColor("#666"))
+                persona_list.addItem(item)
+
+        def get_persona_prompt(current_prompt: str = "") -> Optional[str]:
+            prompt_dialog = QtWidgets.QDialog(dialog)
+            prompt_dialog.setWindowTitle("Persona System Prompt")
+            prompt_dialog.resize(500, 300)
+            layout = QtWidgets.QVBoxLayout(prompt_dialog)
+            layout.addWidget(QtWidgets.QLabel("Enter the system prompt for this persona:"))
+            text_edit = QtWidgets.QPlainTextEdit()
+            text_edit.setPlainText(current_prompt)
+            layout.addWidget(text_edit)
+            buttons = QtWidgets.QDialogButtonBox(
+                QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+            )
+            buttons.accepted.connect(prompt_dialog.accept)
+            buttons.rejected.connect(prompt_dialog.reject)
+            layout.addWidget(buttons)
+            if prompt_dialog.exec() != QtWidgets.QDialog.Accepted:
+                return None
+            return text_edit.toPlainText().strip()
+
+        def add_persona():
+            name_dialog = QtWidgets.QInputDialog(dialog)
+            name_dialog.setWindowTitle("New Persona")
+            name_dialog.setLabelText("Persona Name:")
+            name_dialog.setTextValue("")
+            if name_dialog.exec() != QtWidgets.QDialog.Accepted:
+                return
+            name = name_dialog.textValue().strip()
+            if not name:
+                return
+            if name in self._persona_names():
+                QtWidgets.QMessageBox.warning(dialog, "Duplicate Name", f"Persona '{name}' already exists.")
+                return
+
+            prompt = get_persona_prompt()
+            if prompt is None:
+                return
+
+            self.personas.append({
+                "name": name,
+                "prompt": prompt if prompt else None,
+                "builtin": False,
+            })
+            self._sort_personas_inplace()
+            self._save_persona_state()
+            self._refresh_persona_combos()
+            refresh_persona_list()
+
+        def edit_persona():
+            current = persona_list.currentItem()
+            if not current:
+                QtWidgets.QMessageBox.information(dialog, "No Selection", "Please select a persona to edit.")
+                return
+            name = current.text()
+            persona = self._persona_by_name(name)
+            if not persona:
+                return
+            if persona.get("builtin", False):
+                QtWidgets.QMessageBox.information(dialog, "Built-in Persona", "Built-in personas cannot be edited. Create a custom persona instead.")
+                return
+
+            name_dialog = QtWidgets.QInputDialog(dialog)
+            name_dialog.setWindowTitle("Edit Persona Name")
+            name_dialog.setLabelText("Persona Name:")
+            name_dialog.setTextValue(name)
+            if name_dialog.exec() != QtWidgets.QDialog.Accepted:
+                return
+            new_name = name_dialog.textValue().strip()
+            if not new_name:
+                return
+            if new_name != name and new_name in self._persona_names():
+                QtWidgets.QMessageBox.warning(dialog, "Duplicate Name", f"Persona '{new_name}' already exists.")
+                return
+
+            prompt = get_persona_prompt(persona.get("prompt") or "")
+            if prompt is None:
+                return
+
+            persona["name"] = new_name
+            persona["prompt"] = prompt if prompt else None
+            if name != new_name:
+                for model, assigned in list(self.persona_assignments.items()):
+                    if assigned == name:
+                        self.persona_assignments[model] = new_name
+            self._sort_personas_inplace()
+            self._save_persona_state()
+            self._refresh_persona_combos()
+            refresh_persona_list()
+
+        def delete_persona():
+            current = persona_list.currentItem()
+            if not current:
+                QtWidgets.QMessageBox.information(dialog, "No Selection", "Please select a persona to delete.")
+                return
+            name = current.text()
+            persona = self._persona_by_name(name)
+            if not persona:
+                return
+            if persona.get("builtin", False):
+                QtWidgets.QMessageBox.information(dialog, "Built-in Persona", "Built-in personas cannot be deleted.")
+                return
+            if name == "None":
+                QtWidgets.QMessageBox.information(dialog, "Cannot Delete", "The 'None' persona cannot be deleted.")
+                return
+
+            reply = QtWidgets.QMessageBox.question(
+                dialog, "Delete Persona", f"Are you sure you want to delete '{name}'?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+
+            self.personas = [p for p in self.personas if p["name"] != name]
+            for model, assigned in list(self.persona_assignments.items()):
+                if assigned == name:
+                    self.persona_assignments[model] = "None"
+            self._save_persona_state()
+            self._refresh_persona_combos()
+            refresh_persona_list()
+
+        add_persona_btn.clicked.connect(add_persona)
+        edit_persona_btn.clicked.connect(edit_persona)
+        delete_persona_btn.clicked.connect(delete_persona)
+
+        dialog.exec()
 
     def _single_voter_toggled_state(self, state: int):
         # 'state' is a Qt.CheckState enum; compare directly
@@ -745,12 +1287,32 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
     def _refresh_models(self):
         base = self.base_edit.text().strip() or "http://localhost:1234"
-        self.models = fetch_models_from_lmstudio(base)
+        if self._model_thread and self._model_thread.isRunning():
+            return
 
-        # update checkboxes
+        self._model_worker = ModelFetchWorker(base)
+        self._model_thread = QtCore.QThread(self)
+        self._model_worker.moveToThread(self._model_thread)
+
+        self._model_thread.started.connect(self._model_worker.run)
+        self._model_worker.finished.connect(self._models_fetched)
+        self._model_worker.failed.connect(self._models_fetch_failed)
+
+        self._model_worker.finished.connect(self._model_thread.quit)
+        self._model_worker.failed.connect(self._model_thread.quit)
+        self._model_thread.finished.connect(self._model_thread.deleteLater)
+        self._model_worker.finished.connect(self._model_worker.deleteLater)
+        self._model_worker.failed.connect(self._model_worker.deleteLater)
+
+        self._model_thread.start()
+
+    def _models_fetched(self, models: List[str]):
+        self._model_thread = None
+        self._model_worker = None
+        self.models = models
+
         self._populate_models()
 
-        # sync single voter combo with available models
         self.single_voter_combo.blockSignals(True)
         self.single_voter_combo.clear()
         for m in self.models:
@@ -768,19 +1330,96 @@ class CouncilWindow(QtWidgets.QMainWindow):
         else:
             self._set_status(f"Found {len(self.models)} models.")
 
+    def _models_fetch_failed(self, error: str):
+        self._model_thread = None
+        self._model_worker = None
+        self._busy(False)
+        self._set_status(f"Model refresh failed: {error}")
+
     def _populate_models(self):
-        # clear UI
-        for i in reversed(range(self.models_layout.count())):
-            item = self.models_layout.itemAt(i)
-            w = item.widget()
-            if w:
-                w.setParent(None)
+        # clear UI - remove ALL items including stretches
+        while self.models_layout.count():
+            item = self.models_layout.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+            elif item.spacerItem():
+                # Remove spacer items too
+                pass
+            del item
         self.model_checks.clear()
+        self.model_persona_combos.clear()
+        # Add stretch at the end
+        self.models_layout.addStretch(1)
+
+        # Ensure personas are initialized
+        if not hasattr(self, 'personas') or not self.personas:
+            s = load_settings()
+            self.personas = self._merge_persona_library(s.get("personas", []))
+            if not hasattr(self, 'persona_assignments'):
+                self.persona_assignments = dict(s.get("persona_assignments", {}) or {})
+
+        persona_names = self._persona_names()
+        if not persona_names:
+            # Fallback: ensure at least "None" exists
+            self.personas = [{"name": "None", "prompt": None, "builtin": True}]
+            persona_names = ["None"]
 
         for m in self.models:
+            row_widget = QtWidgets.QWidget()
+            row_widget.setMinimumHeight(28)  # Ensure enough height for button
+            row_layout = QtWidgets.QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(4, 2, 4, 2)
+            row_layout.setSpacing(8)
+
             cb = QtWidgets.QCheckBox(m)
-            self.models_layout.insertWidget(self.models_layout.count() - 1, cb)
+            cb.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+            
+            # Create a button for persona selection instead of dropdown
+            persona_btn = QtWidgets.QPushButton("Persona")
+            persona_btn.setFixedWidth(110)  # Fixed width to prevent layout issues
+            persona_btn.setFixedHeight(24)  # Fixed height to match checkbox
+            persona_btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
+            
+            assigned = self.persona_assignments.get(m, "None")
+            if assigned not in persona_names:
+                assigned = "None"
+            
+            # Update button text to show current persona (truncate if too long)
+            display_text = assigned if assigned != "None" else "Persona"
+            if len(display_text) > 12:
+                display_text = display_text[:10] + ".."
+            persona_btn.setText(display_text)
+            persona_btn.setToolTip(assigned if assigned != "None" else "Select persona")
+            
+            # Show buttons only when personas are enabled
+            persona_btn.setVisible(self.use_roles)
+            persona_btn.setEnabled(self.use_roles)
+            # Ensure button accepts mouse events and is clickable
+            persona_btn.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, False)
+            persona_btn.setFocusPolicy(QtCore.Qt.StrongFocus)
+            persona_btn.setAutoDefault(False)
+            persona_btn.setDefault(False)
+            persona_btn.raise_()  # Ensure button is on top
+            
+            # Connect button click to show persona menu - use direct lambda with explicit capture
+            # Capture model_id and button in the lambda closure
+            model_id_capture = m  # Capture in outer scope
+            button_capture = persona_btn  # Capture in outer scope
+            persona_btn.clicked.connect(
+                lambda checked=False, mid=model_id_capture, btn=button_capture: self._show_persona_menu(mid, btn)
+            )
+            
+            # Add widgets to layout - checkbox gets remaining space, button gets fixed width
+            row_layout.addWidget(cb, stretch=1)
+            row_layout.addWidget(persona_btn, stretch=0)
+            row_layout.setAlignment(persona_btn, QtCore.Qt.AlignRight)
+
+            self.models_layout.insertWidget(self.models_layout.count() - 1, row_widget)
             self.model_checks[m] = cb
+            self.model_persona_combos[m] = persona_btn  # Store button instead of combo
+
+        # Ensure visibility is correct after all buttons are created
+        self._update_persona_combo_visibility()
 
     def _select_all_models(self):
         for cb in self.model_checks.values():
@@ -846,6 +1485,21 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.chat_view.appendPlainText(text)
         self.chat_view.verticalScrollBar().setValue(self.chat_view.verticalScrollBar().maximum())
 
+    def _append_log(self, text: str):
+        if not text:
+            return
+        if self.debug_enabled and not self.log_dock.isVisible():
+            self.log_dock.show()
+        self.log_view.appendPlainText(text)
+        self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
+
+    def _log_sink_dispatch(self, label: str, message: str):
+        if not message:
+            return
+        stamp = datetime.datetime.now().isoformat(timespec="seconds")
+        formatted = f"{stamp} [{label}] {message}"
+        self.log_signal.emit(formatted)
+
     def _set_status(self, text: str):
         self.status_label.setText(text)
 
@@ -864,19 +1518,25 @@ class CouncilWindow(QtWidgets.QMainWindow):
             self._set_status("Ask something first.")
             return
 
-        roles_enabled = self.roles_check.isChecked()
-        roles_map = {m: (random.choice([
-            "You are a meticulous fact-checker. Prefer primary sources and verify each claim.",
-            "You are a pragmatic engineer. Focus on feasible steps, tradeoffs, and edge cases.",
-            "You are a cautious risk assessor. Identify failure modes and propose mitigations.",
-            "You are a clear teacher. Explain concepts simply with short examples where helpful.",
-            "You are a data analyst. Structure answers into bullets, highlight assumptions and limits.",
-            "You are a systems thinker. Map long-term interactions and consequences."
-        ]) if roles_enabled else None) for m in selected}
+        # Use self.use_roles instead of removed roles_check
+        if self.use_roles:
+            roles_map = {}
+            for m in selected:
+                # Get persona from assignments (buttons don't have currentText)
+                persona_name = self.persona_assignments.get(m, "None")
+                if persona_name not in self._persona_names():
+                    persona_name = "None"
+                persona_prompt = self._persona_prompt(persona_name)
+                roles_map[m] = persona_prompt
+                self.persona_assignments[m] = persona_name
+            self._save_persona_state()
+        else:
+            roles_map = {m: None for m in selected}
 
         # Prepare UI
         self._prepare_tabs(selected)
         self._append_chat(f"You: {question}")
+        self.prompt_edit.clear()
         self._set_status("Starting council …")
 
         conc =  int(self.conc_spin.value())
@@ -970,8 +1630,27 @@ class CouncilWindow(QtWidgets.QMainWindow):
 # -----------------------
 def main():
     import sys
+    import platform
     app = QtWidgets.QApplication(sys.argv)
+    app.setApplicationName("PolyCouncil")
+    app.setApplicationDisplayName("PolyCouncil")
+    
+    # Create and set icon
+    icon = create_app_icon()
+    app.setWindowIcon(icon)
+    
+    # On Windows, also set the taskbar icon
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+            # Get the app user model ID for proper taskbar grouping
+            myappid = 'TrentPierce.PolyCouncil.1.0'
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+        except Exception:
+            pass
+    
     w = CouncilWindow()
+    w.setWindowIcon(icon)
     w.show()
     sys.exit(app.exec())
 
