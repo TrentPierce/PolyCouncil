@@ -55,3 +55,13 @@ temp/
 
 # Editors / workspace
 *.code-workspace
+
+# Build artifacts (PyInstaller)
+build/
+dist/
+*.spec.bak
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
