@@ -199,7 +199,9 @@ Test how different personas affect model responses. Useful for understanding bia
 
 ## Screenshots
 
-*Screenshots coming soon!*
+![PolyCouncil Voting](Polycouncil1.png)
+
+![PolyCouncil Result](Polycouncil2.png)
 
 ---
 
