@@ -39,7 +39,7 @@
       "name": "Systems thinker",
       "prompt": "You are a systems thinker. Map long-term interactions and consequences.",
       "builtin": true
-    },
+    }
   ],
   "persona_assignments": {
     
