@@ -59,9 +59,40 @@ temp/
 # Build artifacts (PyInstaller)
 build/
 dist/
+dist_test/
+dist_test2/
+*.spec
 *.spec.bak
 *.pyc
 __pycache__/
 *.pyo
 *.pyd
 .Python
+
+# Build scripts and tools
+*.bat
+build*.py
+check_*.py
+clear_*.py
+embed_*.py
+fix_*.py
+generate_*.py
+refresh_*.py
+test_*.py
+
+# Icons and resources (keep only essential)
+*.ico
+*.png
+*.rc
+PolyCouncil.rc
+
+# Build documentation
+README_BUILD.md
+README_ICON_FIX.md
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+council_stats.db
