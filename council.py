@@ -13,10 +13,24 @@ import json
 import threading
 import re
 import random
+import uuid
+import markdown  # type: ignore
+import base64
 from pathlib import Path
 from typing import Optional, Dict, List, Callable, Awaitable, Any, Iterable, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
+
+# Import new core modules
+try:
+    from core.tool_manager import FileParser, ModelCapabilityDetector
+    from core.discussion_manager import DiscussionManager, CORE_SYSTEM_INSTRUCTION
+except ImportError:
+    # Fallback if modules not found
+    FileParser = None
+    ModelCapabilityDetector = None
+    DiscussionManager = None
+    CORE_SYSTEM_INSTRUCTION = ""
 
 # Try optional theming (follows system)
 try:
@@ -37,7 +51,7 @@ DEFAULT_PERSONAS: List[dict] = [
     {"name": "Pragmatic engineer", "prompt": "You are a pragmatic engineer. Focus on feasible steps, tradeoffs, and edge cases.", "builtin": True},
     {"name": "Cautious risk assessor", "prompt": "You are a cautious risk assessor. Identify failure modes and propose mitigations.", "builtin": True},
     {"name": "Clear teacher", "prompt": "You are a clear teacher. Explain concepts simply with short examples where helpful.", "builtin": True},
-    {"name": "Data analyst", "prompt": "You are a data analyst. Structure answers into bullets, highlight assumptions and limits.", "builtin": True},
+    {"name": "Structured Data Analyst", "prompt": "You are a data analyst. Structure answers into bullets, highlight assumptions and limits.", "builtin": True},
     {"name": "Systems thinker", "prompt": "You are a systems thinker. Map long-term interactions and consequences.", "builtin": True},
 ]
 
@@ -141,6 +155,8 @@ def short_id(mid: str, n: int = 28) -> str:
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "council_stats.db"
 SETTINGS_PATH = APP_DIR / "council_settings.json"
+DEFAULT_PERSONAS_PATH = APP_DIR / "config" / "default_personas.json"
+USER_PERSONAS_PATH = APP_DIR / "config" / "user_personas.json"
 
 def load_settings() -> dict:
     if SETTINGS_PATH.exists():
@@ -262,7 +278,9 @@ async def call_model(
     temperature: float = 0.2,
     sys_prompt: Optional[str] = None,
     json_schema: Optional[dict] = None,
-    timeout_sec: int = 120
+    timeout_sec: int = 120,
+    images: List[str] = [],
+    web_search: bool = False
 ) -> Any:
     """
     Calls LM Studio's OpenAI-compatible chat API.
@@ -273,7 +291,18 @@ async def call_model(
     messages = []
     if sys_prompt:
         messages.append({"role": "system", "content": sys_prompt})
-    messages.append({"role": "user", "content": user_prompt})
+    
+    # Handle multimodal content
+    if images:
+        content_list = [{"type": "text", "text": user_prompt}]
+        for img_b64 in images:
+            content_list.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
+            })
+        messages.append({"role": "user", "content": content_list})
+    else:
+        messages.append({"role": "user", "content": user_prompt})
 
     payload = {
         "model": model,
@@ -282,6 +311,23 @@ async def call_model(
     }
     if json_schema:
         payload["response_format"] = {"type": "json_schema", "json_schema": json_schema}
+
+    # Inject Web Search Tools if enabled
+    if web_search:
+        payload["tools"] = [{
+            "type": "function",
+            "function": {
+                "name": "google_search",
+                "description": "Search the web for current information.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "The search query"}
+                    },
+                    "required": ["query"]
+                }
+            }
+        }]
 
     _dbg("CALL payload", {"url": url, "payload": payload})
     timeout=aiohttp.ClientTimeout(total=timeout_sec)
@@ -489,29 +535,50 @@ async def council_round(
     roles: Dict[str, Optional[str]],
     status_cb: Callable[[str], None],
     max_concurrency: int = 1,
-    voter_override: Optional[List[str]] = None
+    voter_override: Optional[List[str]] = None,
+    images: List[str] = [],
+    web_search: bool = False,
+    temperature: float = 0.7,
+    is_cancelled: Optional[Callable[[], bool]] = None
 ):
     status_cb("Collecting answers…")
     async with aiohttp.ClientSession() as session:
 
         async def answer_one(model_id: str) -> tuple[str, str]:
+            if is_cancelled and is_cancelled():
+                return model_id, "[Cancelled]"
+            
             user_prompt = question
             sys_p = roles.get(model_id) or None
             try:
-                ans = await call_model(session, base_url, model_id, user_prompt, temperature=0.5, sys_prompt=sys_p)
+                ans = await call_model(
+                    session, base_url, model_id, user_prompt, 
+                    temperature=temperature, sys_prompt=sys_p, 
+                    images=images, web_search=web_search
+                )
                 if isinstance(ans, dict):
                     ans = json.dumps(ans, ensure_ascii=False)
                 return model_id, ans
             except Exception as e1:
                 return model_id, f"[ERROR fetching answer]\n{e1}"
 
+        # Check cancellation before starting
+        if is_cancelled and is_cancelled():
+            raise RuntimeError("Process cancelled by user")
+
         pairs = await run_limited(max_concurrency, [lambda m=m: answer_one(m) for m in selected_models])
+        
+        # Check cancellation after answers
+        if is_cancelled and is_cancelled():
+            raise RuntimeError("Process cancelled by user")
+            
         answers = {m: a for m, a in pairs}
         errors = {m: a for m, a in pairs if isinstance(a, str) and a.startswith("[ERROR")}
 
         status_cb("Models are voting…")
 
         voters_to_use = voter_override if voter_override else selected_models
+        # Note: Voting phase does not use images or web search, typically.
         vote_results = await run_limited(
             max_concurrency,
             [lambda m=m: vote_one(session, base_url, m, question, answers, selected_models) for m in voters_to_use]
@@ -591,6 +658,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
     result_signal = QtCore.Signal(object)   # (question, answers, winner, details, tally)
     error_signal  = QtCore.Signal(str)
     log_signal    = QtCore.Signal(str)
+    discussion_update_signal = QtCore.Signal(object)  # (entry_dict) for real-time updates
+    capability_update_signal = QtCore.Signal()  # Signal to update capability UI
 
     def __init__(self):
         super().__init__()
@@ -618,6 +687,12 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.model_tabs: Dict[str, QtWidgets.QWidget] = {}
         self.model_texts: Dict[str, QtWidgets.QPlainTextEdit] = {}
         self.model_persona_combos: Dict[str, QtWidgets.QComboBox] = {}
+        
+        # New features
+        self.mode = "deliberation"  # "deliberation" or "discussion"
+        self.uploaded_files: List[Path] = []
+        self.model_capabilities: Dict[str, Dict[str, bool]] = {}  # model -> {web_search: bool, visual: bool}
+        self.web_search_enabled = False
 
         self._build_ui()
         self._setup_log_dock()
@@ -678,8 +753,18 @@ class CouncilWindow(QtWidgets.QMainWindow):
         t_font.setPointSize(t_font.pointSize() + 2)
         t_font.setBold(True)
         title.setFont(t_font)
+        
+        # Mode selection
+        mode_label = QtWidgets.QLabel("Mode:")
+        self.mode_combo = QtWidgets.QComboBox()
+        self.mode_combo.addItems(["Deliberation Mode", "Collaborative Discussion Mode"])
+        self.mode_combo.setCurrentIndex(0)
+        
         self.settings_btn = QtWidgets.QPushButton("Settings")
         nav.addWidget(title)
+        nav.addSpacing(20)
+        nav.addWidget(mode_label)
+        nav.addWidget(self.mode_combo)
         nav.addStretch(1)
         nav.addWidget(self.settings_btn)
         layout.addLayout(nav)
@@ -734,8 +819,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
         left = QtWidgets.QVBoxLayout()
         left.setSpacing(8)
 
-        lb_title = QtWidgets.QLabel("Leaderboard")
-        lb_title.setStyleSheet("font-weight: 600;")
+        self.lb_title = QtWidgets.QLabel("Leaderboard")
+        self.lb_title.setStyleSheet("font-weight: 600;")
         self.leader_list = QtWidgets.QListWidget()
         self.reset_btn = QtWidgets.QPushButton("Reset Leaderboard")
 
@@ -760,7 +845,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
         model_btn_row.addWidget(self.select_all_btn)
         model_btn_row.addWidget(self.clear_btn)
 
-        left.addWidget(lb_title)
+        left.addWidget(self.lb_title)
         left.addWidget(self.leader_list)
         left.addWidget(self.reset_btn)
         left.addSpacing(8)
@@ -773,23 +858,84 @@ class CouncilWindow(QtWidgets.QMainWindow):
         left_widget.setMinimumWidth(420)  # Increased to accommodate persona buttons
         grid.addWidget(left_widget, 0, 0)
 
-        # Center: Chat
+        # Center: Chat with file upload and tool controls
         center = QtWidgets.QVBoxLayout()
         center.setSpacing(8)
 
         chat_title = QtWidgets.QLabel("Chat")
         chat_title.setStyleSheet("font-weight: 600;")
-        self.chat_view = QtWidgets.QPlainTextEdit()
+        
+        # File upload area
+        file_group = QtWidgets.QGroupBox("File Upload")
+        file_layout = QtWidgets.QVBoxLayout(file_group)
+        file_layout.setSpacing(4)
+        
+        file_btn_row = QtWidgets.QHBoxLayout()
+        self.upload_btn = QtWidgets.QPushButton("Upload File")
+        self.clear_files_btn = QtWidgets.QPushButton("Clear Files")
+        file_btn_row.addWidget(self.upload_btn)
+        file_btn_row.addWidget(self.clear_files_btn)
+        file_btn_row.addStretch(1)
+        
+        self.files_list = QtWidgets.QListWidget()
+        self.files_list.setMaximumHeight(80)
+        self.files_list.setToolTip("Uploaded files will be parsed and included as context")
+        
+        # Visual/image support indicator (moved into file upload box)
+        self.visual_status = QtWidgets.QLabel("Visual/Image Support: Not detected")
+        self.visual_status.setStyleSheet("font-size: 10pt;")
+        
+        file_layout.addLayout(file_btn_row)
+        file_layout.addWidget(self.files_list)
+        file_layout.addWidget(self.visual_status)
+        
+        # Tool status indicators (web search only now)
+        tool_group = QtWidgets.QGroupBox("Model Capabilities")
+        tool_layout = QtWidgets.QVBoxLayout(tool_group)
+        tool_layout.setSpacing(4)
+        
+        self.web_search_check = QtWidgets.QCheckBox("Enable Web Search")
+        self.web_search_check.setEnabled(False)
+        self.web_search_check.setToolTip("Enable if your model supports web search tools")
+        
+        tool_layout.addWidget(self.web_search_check)
+        
+        # Advanced parameters
+        param_group = QtWidgets.QGroupBox("Parameters")
+        param_layout = QtWidgets.QHBoxLayout(param_group)
+        
+        param_layout.addWidget(QtWidgets.QLabel("Temp:"))
+        self.temp_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.temp_slider.setRange(0, 100)
+        self.temp_slider.setValue(70)  # 0.7 default
+        self.temp_value_label = QtWidgets.QLabel("0.7")
+        self.temp_slider.valueChanged.connect(lambda v: self.temp_value_label.setText(f"{v/100:.1f}"))
+        
+        param_layout.addWidget(self.temp_slider)
+        param_layout.addWidget(self.temp_value_label)
+        
+        center.addWidget(chat_title)
+        center.addWidget(file_group)
+        center.addWidget(tool_group)
+        center.addWidget(param_group)
+        
+        # Chat view - switch to QTextBrowser for HTML/Markdown
+        self.chat_view = QtWidgets.QTextBrowser()
+        self.chat_view.setOpenExternalLinks(True)
         self.chat_view.setReadOnly(True)
+        
         self.prompt_edit = QtWidgets.QLineEdit()
         self.prompt_edit.setPlaceholderText("Ask the council…")
         self.send_btn = QtWidgets.QPushButton("Send")
+        self.stop_btn = QtWidgets.QPushButton("Stop")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.setStyleSheet("background-color: #ffcccc; color: black;")
 
         entry_row = QtWidgets.QHBoxLayout()
         entry_row.addWidget(self.prompt_edit, stretch=1)
         entry_row.addWidget(self.send_btn)
+        entry_row.addWidget(self.stop_btn)
 
-        center.addWidget(chat_title)
         center.addWidget(self.chat_view, stretch=1)
         center.addLayout(entry_row)
 
@@ -801,11 +947,11 @@ class CouncilWindow(QtWidgets.QMainWindow):
         right = QtWidgets.QVBoxLayout()
         right.setSpacing(8)
 
-        tabs_title = QtWidgets.QLabel("Per-Model Answers")
-        tabs_title.setStyleSheet("font-weight: 600;")
+        self.tabs_title = QtWidgets.QLabel("Per-Model Answers")
+        self.tabs_title.setStyleSheet("font-weight: 600;")
         self.tabs = QtWidgets.QTabWidget()
 
-        right.addWidget(tabs_title)
+        right.addWidget(self.tabs_title)
         right.addWidget(self.tabs, stretch=1)
 
         right_widget = QtWidgets.QWidget()
@@ -849,8 +995,15 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.reset_btn.clicked.connect(self._reset_leaderboard_clicked)
         self.send_btn.clicked.connect(self._send)
         self.prompt_edit.returnPressed.connect(self._send)
+        self.stop_btn.clicked.connect(self._stop_process)
         self.conc_spin.valueChanged.connect(self._concurrency_changed)
         self.settings_btn.clicked.connect(self._open_settings_dialog)
+        
+        # New signal connections
+        self.mode_combo.currentIndexChanged.connect(self._mode_changed)
+        self.upload_btn.clicked.connect(self._upload_file)
+        self.clear_files_btn.clicked.connect(self._clear_files)
+        self.web_search_check.toggled.connect(self._web_search_toggled)
 
         # single-voter signals (make sure message shows correct ON/OFF)
         self.single_voter_check.toggled.connect(self._single_voter_toggled_bool)
@@ -860,6 +1013,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.result_signal.connect(self._handle_result)
         self.error_signal.connect(self._handle_error)
         self.log_signal.connect(self._append_log)
+        self.discussion_update_signal.connect(self._update_discussion_view)
+        self.capability_update_signal.connect(self._update_capability_ui)
 
     # ----- actions -----
     def _update_persona_combo_visibility(self):
@@ -947,8 +1102,46 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
     def _merge_persona_library(self, stored: Iterable[dict]) -> List[dict]:
         library: Dict[str, dict] = {}
+        
+        # Load default personas from config/default_personas.json
+        if DEFAULT_PERSONAS_PATH.exists():
+            try:
+                with open(DEFAULT_PERSONAS_PATH, 'r', encoding='utf-8') as f:
+                    default_personas = json.load(f)
+                    for persona in default_personas:
+                        name = persona.get("name")
+                        if name:
+                            library[name] = {
+                                "name": name,
+                                "prompt": persona.get("prompt_instruction"),
+                                "builtin": True,
+                            }
+            except Exception as e:
+                print(f"Error loading default personas: {e}")
+        
+        # Load user personas from config/user_personas.json
+        if USER_PERSONAS_PATH.exists():
+            try:
+                with open(USER_PERSONAS_PATH, 'r', encoding='utf-8') as f:
+                    user_personas = json.load(f)
+                    for persona in user_personas:
+                        name = persona.get("name")
+                        if name:
+                            library[name] = {
+                                "name": name,
+                                "prompt": persona.get("prompt_instruction"),
+                                "builtin": False,
+                            }
+            except Exception as e:
+                print(f"Error loading user personas: {e}")
+        
+        # Also merge from legacy DEFAULT_PERSONAS
         for persona in DEFAULT_PERSONAS:
-            library[persona["name"]] = dict(persona)
+            name = persona.get("name")
+            if name and name not in library:
+                library[name] = dict(persona)
+        
+        # Merge from stored (legacy council_settings.json personas)
         for entry in stored or []:
             name = entry.get("name")
             if not name:
@@ -1169,11 +1362,36 @@ class CouncilWindow(QtWidgets.QMainWindow):
             if prompt is None:
                 return
 
+            # Generate unique ID for user persona
+            persona_id = f"u_{uuid.uuid4().hex[:8]}"
+            
+            # Add to local personas list
             self.personas.append({
                 "name": name,
                 "prompt": prompt if prompt else None,
                 "builtin": False,
             })
+            
+            # Save to user_personas.json
+            try:
+                if USER_PERSONAS_PATH.exists():
+                    with open(USER_PERSONAS_PATH, 'r', encoding='utf-8') as f:
+                        user_personas = json.load(f)
+                else:
+                    user_personas = []
+                
+                user_personas.append({
+                    "id": persona_id,
+                    "name": name,
+                    "prompt_instruction": prompt if prompt else ""
+                })
+                
+                USER_PERSONAS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                with open(USER_PERSONAS_PATH, 'w', encoding='utf-8') as f:
+                    json.dump(user_personas, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                print(f"Error saving user persona: {e}")
+            
             self._sort_personas_inplace()
             self._save_persona_state()
             self._refresh_persona_combos()
@@ -1211,6 +1429,22 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
             persona["name"] = new_name
             persona["prompt"] = prompt if prompt else None
+            
+            # Update user_personas.json
+            try:
+                if USER_PERSONAS_PATH.exists():
+                    with open(USER_PERSONAS_PATH, 'r', encoding='utf-8') as f:
+                        user_personas = json.load(f)
+                    for p in user_personas:
+                        if p.get("name") == name:
+                            p["name"] = new_name
+                            p["prompt_instruction"] = prompt if prompt else ""
+                            break
+                    with open(USER_PERSONAS_PATH, 'w', encoding='utf-8') as f:
+                        json.dump(user_personas, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                print(f"Error updating user persona: {e}")
+            
             if name != new_name:
                 for model, assigned in list(self.persona_assignments.items()):
                     if assigned == name:
@@ -1243,7 +1477,20 @@ class CouncilWindow(QtWidgets.QMainWindow):
             if reply != QtWidgets.QMessageBox.Yes:
                 return
 
+            # Remove from local list
             self.personas = [p for p in self.personas if p["name"] != name]
+            
+            # Remove from user_personas.json
+            try:
+                if USER_PERSONAS_PATH.exists():
+                    with open(USER_PERSONAS_PATH, 'r', encoding='utf-8') as f:
+                        user_personas = json.load(f)
+                    user_personas = [p for p in user_personas if p.get("name") != name]
+                    with open(USER_PERSONAS_PATH, 'w', encoding='utf-8') as f:
+                        json.dump(user_personas, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                print(f"Error deleting user persona: {e}")
+            
             for model, assigned in list(self.persona_assignments.items()):
                 if assigned == name:
                     self.persona_assignments[model] = "None"
@@ -1324,11 +1571,114 @@ class CouncilWindow(QtWidgets.QMainWindow):
                 self.single_voter_combo.setCurrentIndex(ix)
         self.single_voter_combo.blockSignals(False)
 
+        # Detect model capabilities
+        if ModelCapabilityDetector and models:
+            self._detect_model_capabilities()
+
         self._busy(False)
         if not self.models:
             self._set_status("No models found. Check base URL or LM Studio.")
         else:
             self._set_status(f"Found {len(self.models)} models.")
+    
+    def _detect_model_capabilities(self):
+        """Detect capabilities for loaded models."""
+        if not ModelCapabilityDetector:
+            return
+        
+        base = self.base_edit.text().strip() or "http://localhost:1234"
+        
+        async def detect_all():
+            async with aiohttp.ClientSession() as session:
+                # Check all models, not just first 3
+                for model in self.models:
+                    try:
+                        # Quick check: if model name contains "vl" or "VL", it likely supports visual
+                        model_lower = model.lower()
+                        has_vl = "vl" in model_lower
+                        
+                        # Use API detection, but also check model name
+                        web_search = await ModelCapabilityDetector.detect_web_search(session, base, model)
+                        visual_api = await ModelCapabilityDetector.detect_visual(session, base, model)
+                        visual = visual_api or has_vl  # Combine API detection with name check
+                        
+                        self.model_capabilities[model] = {
+                            "web_search": web_search,
+                            "visual": visual
+                        }
+                    except Exception:
+                        # Fallback: check model name for "vl" pattern
+                        model_lower = model.lower()
+                        has_vl = "vl" in model_lower
+                        self.model_capabilities[model] = {
+                            "web_search": False,
+                            "visual": has_vl
+                        }
+        
+        # Run detection in background
+        def worker():
+            try:
+                asyncio.run(detect_all())
+                # Update UI using signal (thread-safe)
+                self.status_signal.emit("Capability detection complete")
+                # Emit signal to update UI on main thread
+                self.capability_update_signal.emit()
+            except Exception:
+                pass
+        
+        threading.Thread(target=worker, daemon=True).start()
+    
+    @QtCore.Slot()
+    def _update_capability_ui(self):
+        """Update UI to reflect detected capabilities."""
+        # Use signal to update from background thread
+        self.status_signal.emit("Updating capability indicators...")
+        
+        # Check selected models for capabilities
+        selected_models = [m for m, cb in self.model_checks.items() if cb.isChecked()]
+        
+        # Check if any SELECTED model supports visual
+        has_visual = False
+        if selected_models:
+            has_visual = any(
+                self.model_capabilities.get(model, {}).get("visual", False) 
+                for model in selected_models
+            )
+            # Also check model names for "vl" pattern as fallback
+            if not has_visual:
+                has_visual = any("vl" in model.lower() for model in selected_models)
+        else:
+            # If no models selected, check all models
+            has_visual = any(caps.get("visual", False) for caps in self.model_capabilities.values())
+            if not has_visual:
+                has_visual = any("vl" in model.lower() for model in self.models)
+        
+        if has_visual:
+            self.visual_status.setText("Visual/Image Support: ✓ Detected")
+            self.visual_status.setStyleSheet("color: green;")
+        else:
+            self.visual_status.setText("Visual/Image Support: Not detected")
+            self.visual_status.setStyleSheet("")
+        
+        # Check if any SELECTED model supports web search
+        has_web_search = False
+        if selected_models:
+            has_web_search = any(
+                self.model_capabilities.get(model, {}).get("web_search", False) 
+                for model in selected_models
+            )
+        else:
+            has_web_search = any(caps.get("web_search", False) for caps in self.model_capabilities.values())
+        
+        if has_web_search:
+            self.web_search_check.setEnabled(True)
+            self.web_search_check.setToolTip("Web search capability detected. Enable to use.")
+        else:
+            self.web_search_check.setEnabled(False)
+            self.web_search_check.setToolTip("No web search capability detected.")
+        
+        # Update file upload button based on visual support
+        self._update_file_upload_capabilities(has_visual)
 
     def _models_fetch_failed(self, error: str):
         self._model_thread = None
@@ -1417,6 +1767,9 @@ class CouncilWindow(QtWidgets.QMainWindow):
             self.models_layout.insertWidget(self.models_layout.count() - 1, row_widget)
             self.model_checks[m] = cb
             self.model_persona_combos[m] = persona_btn  # Store button instead of combo
+            
+            # Connect model selection change to update capabilities
+            cb.toggled.connect(self._on_model_selection_changed)
 
         # Ensure visibility is correct after all buttons are created
         self._update_persona_combo_visibility()
@@ -1482,7 +1835,40 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.model_texts["_RESULTS_"].setPlainText("")
 
     def _append_chat(self, text: str):
-        self.chat_view.appendPlainText(text)
+        # Convert simple text to HTML/Markdown for QTextBrowser
+        if not text:
+            return
+        
+        # Simple styling
+        style = "margin: 5px; padding: 8px; border-radius: 8px;"
+        
+        if text.startswith("You:"):
+            # User bubble: Aligned right (simulated), distinct color
+            style += "background-color: #e6f3ff; color: #000000;"
+            formatted_text = text.replace("You:", "<b>You:</b>")
+        elif "→" in text:
+            # System/Council bubble
+            style += "background-color: #f0f0f0; color: #000000;"
+            parts = text.split(":", 1)
+            if len(parts) == 2:
+                formatted_text = f"<b>{parts[0]}:</b>{parts[1]}"
+            else:
+                formatted_text = text
+        elif text.startswith("<i>"):
+            # Info message
+            style += "background-color: transparent; color: #666666;"
+            formatted_text = text
+        else:
+            # Generic
+            style += "background-color: #ffffff; border: 1px solid #ddd; color: #000000;"
+            formatted_text = text
+            
+        # Convert content to markdown (excluding the headers if possible, but mixed is tricky)
+        # We will just markdown the message part if we split it, but for simplicity:
+        html_content = markdown.markdown(formatted_text)
+        
+        full_html = f"<div style='{style}'>{html_content}</div>"
+        self.chat_view.append(full_html)
         self.chat_view.verticalScrollBar().setValue(self.chat_view.verticalScrollBar().maximum())
 
     def _append_log(self, text: str):
@@ -1506,7 +1892,119 @@ class CouncilWindow(QtWidgets.QMainWindow):
     def _busy(self, on: bool):
         self.busy.setVisible(on)
         self.busy.setMaximum(0 if on else 1)
+        if hasattr(self, 'stop_btn'):
+            self.stop_btn.setEnabled(on)
+        if hasattr(self, 'send_btn'):
+            self.send_btn.setEnabled(not on)
 
+    def _mode_changed(self, index: int):
+        """Handle mode selection change."""
+        self.mode = "discussion" if index == 1 else "deliberation"
+        # Update UI based on mode
+        if self.mode == "discussion":
+            self.tabs_title.setText("Discussion View")
+            # Hide single voter controls in discussion mode
+            self.single_voter_check.setVisible(False)
+            self.single_voter_combo.setVisible(False)
+            # Hide leaderboard in discussion mode
+            self.lb_title.setVisible(False)
+            self.leader_list.setVisible(False)
+            self.reset_btn.setVisible(False)
+        else:
+            self.tabs_title.setText("Per-Model Answers")
+            self.single_voter_check.setVisible(True)
+            self.single_voter_combo.setVisible(True)
+            # Show leaderboard in deliberation mode
+            self.lb_title.setVisible(True)
+            self.leader_list.setVisible(True)
+            self.reset_btn.setVisible(True)
+    
+    def _update_file_upload_capabilities(self, has_visual: bool):
+        """Update file upload button and tooltip based on visual support."""
+        if has_visual:
+            self.upload_btn.setToolTip("Upload documents or images (PDF, TXT, DOCX, JPG, PNG, etc.)")
+        else:
+            self.upload_btn.setToolTip("Upload documents only (PDF, TXT, DOCX) - No visual models selected")
+    
+    def _upload_file(self):
+        """Handle file upload."""
+        if FileParser is None:
+            QtWidgets.QMessageBox.warning(self, "File Parsing Unavailable", 
+                "File parsing libraries not installed. Install PyPDF2 and python-docx.")
+            return
+        
+        # Check if any selected model supports visual
+        selected_models = [m for m, cb in self.model_checks.items() if cb.isChecked()]
+        has_visual = False
+        if selected_models:
+            has_visual = any(
+                self.model_capabilities.get(model, {}).get("visual", False) 
+                for model in selected_models
+            )
+            # Also check model names for "vl" pattern
+            if not has_visual:
+                has_visual = any("vl" in model.lower() for model in selected_models)
+        
+        # Build file filter based on visual support
+        if has_visual:
+            file_filter = (
+                "All Supported (*.txt *.pdf *.docx *.doc *.jpg *.jpeg *.png *.gif *.webp);;"
+                "Documents (*.txt *.pdf *.docx *.doc);;"
+                "Images (*.jpg *.jpeg *.png *.gif *.webp);;"
+                "Text Files (*.txt);;PDF Files (*.pdf);;Word Documents (*.docx *.doc)"
+            )
+        else:
+            file_filter = (
+                "Documents (*.txt *.pdf *.docx *.doc);;"
+                "Text Files (*.txt);;PDF Files (*.pdf);;Word Documents (*.docx *.doc)"
+            )
+        
+        file_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select File", "", file_filter
+        )
+        
+        if file_path:
+            path = Path(file_path)
+            
+            # Check if it's an image file
+            is_image = path.suffix.lower() in ['.jpg', '.jpeg', '.png', '.gif', '.webp']
+            
+            if is_image and not has_visual:
+                QtWidgets.QMessageBox.warning(
+                    self, "Image Upload Not Available",
+                    "No visual models are currently selected. Please select a model with visual capabilities (name contains 'vl' or 'VL') to upload images."
+                )
+                return
+            
+            if path not in self.uploaded_files:
+                self.uploaded_files.append(path)
+                self.files_list.addItem(path.name)
+                file_type = "image" if is_image else "document"
+                self._set_status(f"{file_type.capitalize()} uploaded: {path.name}")
+    
+    def _on_model_selection_changed(self):
+        """Update UI when model selection changes."""
+        # Update capability indicators based on selected models
+        self._update_capability_ui()
+    
+    def _clear_files(self):
+        """Clear uploaded files."""
+        self.uploaded_files.clear()
+        self.files_list.clear()
+        self._set_status("Files cleared")
+    
+    def _web_search_toggled(self, checked: bool):
+        """Handle web search toggle."""
+        self.web_search_enabled = checked
+    
+    def _stop_process(self):
+        """Handle stop button click."""
+        self._stop_requested = True
+        self._set_status("Stopping...")
+        self._busy(False)
+        self._append_chat("[Stopped] Process cancelled by user.")
+        self._set_status("Stopped.")
+    
     def _send(self):
         base = self.base_edit.text().strip() or "http://localhost:1234"
         selected = [m for m, cb in self.model_checks.items() if cb.isChecked()]
@@ -1518,6 +2016,57 @@ class CouncilWindow(QtWidgets.QMainWindow):
             self._set_status("Ask something first.")
             return
 
+        # Parse uploaded files for context and images
+        context_block = ""
+        images_b64 = []
+        
+        if self.uploaded_files:
+            context_parts = []
+            max_file_size = 50000  # Limit each file to 50k chars before parsing
+            for file_path in self.uploaded_files:
+                suffix = file_path.suffix.lower()
+                # Check for images
+                if suffix in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']:
+                    try:
+                        with open(file_path, "rb") as img_file:
+                            b64_data = base64.b64encode(img_file.read()).decode('utf-8')
+                            images_b64.append(b64_data)
+                    except Exception as e:
+                        self._set_status(f"Error processing image {file_path.name}: {e}")
+                    continue
+                
+                if FileParser:
+                    parsed = FileParser.parse_file(file_path)
+                    if parsed:
+                        # Limit individual file content size
+                        if len(parsed) > max_file_size:
+                            # Truncate at sentence boundary
+                            truncated = parsed[:max_file_size]
+                            last_period = truncated.rfind('.')
+                            last_newline = truncated.rfind('\n')
+                            cutoff = max(last_period, last_newline)
+                            if cutoff > max_file_size * 0.8:
+                                parsed = parsed[:cutoff + 1] + "\n\n[... file content truncated for processing ...]"
+                            else:
+                                parsed = truncated + "\n\n[... file content truncated for processing ...]"
+                        
+                        context_parts.append(FileParser.format_context_block(parsed, file_path.name))
+            context_block = "\n".join(context_parts)
+            
+            # Final safety check: if total context is still huge, truncate aggressively
+            if len(context_block) > 100000:  # 100k chars = ~25k tokens, way too much
+                self._set_status(f"Warning: File context very large ({len(context_block)} chars), will be summarized...")
+                # Truncate to 20k chars before passing to DiscussionManager for summarization
+                context_block = context_block[:20000] + "\n\n[... additional content truncated ...]"
+
+        # Handle mode selection
+        if self.mode == "discussion":
+            self._send_discussion_mode(base, selected, question, context_block, images_b64)
+        else:
+            self._send_deliberation_mode(base, selected, question, context_block, images_b64)
+    
+    def _send_deliberation_mode(self, base: str, selected: List[str], question: str, context_block: str, images: List[str] = []):
+        """Send in Deliberation Mode (existing functionality)."""
         # Use self.use_roles instead of removed roles_check
         if self.use_roles:
             roles_map = {}
@@ -1533,36 +2082,296 @@ class CouncilWindow(QtWidgets.QMainWindow):
         else:
             roles_map = {m: None for m in selected}
 
+        # Inject context block into prompts if available
+        if context_block:
+            for m in roles_map:
+                if roles_map[m]:
+                    roles_map[m] = context_block + "\n\n" + roles_map[m]
+                else:
+                    roles_map[m] = context_block
+
         # Prepare UI
         self._prepare_tabs(selected)
         self._append_chat(f"You: {question}")
+        if images:
+            self._append_chat(f"<i>[Attached {len(images)} image(s)]</i>")
         self.prompt_edit.clear()
         self._set_status("Starting council …")
 
         conc =  int(self.conc_spin.value())
         single_voter_enabled = self.single_voter_check.isChecked()
         single_voter_model   = self.single_voter_combo.currentText().strip()
+        
+        # Get temperature from slider (convert 0-100 to 0.0-1.0)
+        temp = self.temp_slider.value() / 100.0
+        
+        # Web search status
+        web_search = self.web_search_check.isChecked()
 
         def worker():
             try:
+                self._stop_requested = False
                 voters = [single_voter_model] if (single_voter_enabled and single_voter_model) else None
                 answers, winner, details, tally = asyncio.run(
                     council_round(
                         base, selected, question, roles_map, self.status_signal.emit,
-                        max_concurrency=conc, voter_override=voters
+                        max_concurrency=conc, voter_override=voters,
+                        images=images, web_search=web_search, temperature=temp,
+                        is_cancelled=lambda: self._stop_requested
                     )
                 )
-                # record leaderboard
-                try:
-                    record_vote(question, winner, details)
-                except Exception:
-                    pass
-                self.result_signal.emit((question, answers, winner, details, tally))
+                if not self._stop_requested:
+                    # record leaderboard
+                    try:
+                        record_vote(question, winner, details)
+                    except Exception:
+                        pass
+                    self.result_signal.emit((question, answers, winner, details, tally))
             except Exception as e:
-                self.error_signal.emit(str(e))
+                if not self._stop_requested:
+                    self.error_signal.emit(str(e))
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._current_worker_thread = threading.Thread(target=worker, daemon=True)
+        self._current_worker_thread.start()
         self._busy(True)
+    
+    def _send_discussion_mode(self, base: str, selected: List[str], question: str, context_block: str):
+        """Send in Collaborative Discussion Mode."""
+        if DiscussionManager is None:
+            QtWidgets.QMessageBox.warning(self, "Discussion Mode Unavailable", 
+                "Discussion mode requires core modules. Please check installation.")
+            return
+        
+        # Build agent configurations
+        agents = []
+        for model in selected:
+            persona_name = self.persona_assignments.get(model, "None")
+            persona_config = self._build_persona_config(model, persona_name)
+            
+            agent = {
+                "name": f"Agent {model[:20]}",
+                "model": model,
+                "is_active": True,
+                "persona_config": persona_config,
+                "persona_name": persona_name if persona_name != "None" else None
+            }
+            agents.append(agent)
+        
+        # Prepare UI for discussion mode
+        self._prepare_discussion_tabs(selected)
+        self._append_chat(f"You: {question}")
+        self.prompt_edit.clear()
+        self._set_status("Starting collaborative discussion…")
+
+        conc = int(self.conc_spin.value())
+
+        def worker():
+            try:
+                self._stop_requested = False
+                manager = DiscussionManager(
+                    base_url=base,
+                    agents=agents,
+                    user_prompt=question,
+                    context_block=context_block,
+                    status_callback=self.status_signal.emit,
+                    update_callback=lambda entry: self.discussion_update_signal.emit(entry),
+                    max_turns=10,
+                    max_concurrency=conc
+                )
+                transcript, synthesis = asyncio.run(manager.run_discussion())
+                if not self._stop_requested:
+                    self.result_signal.emit(("discussion", question, transcript, synthesis))
+            except Exception as e:
+                if not self._stop_requested:
+                    self.error_signal.emit(str(e))
+
+        self._current_worker_thread = threading.Thread(target=worker, daemon=True)
+        self._current_worker_thread.start()
+        self._busy(True)
+    
+    def _build_persona_config(self, model: str, persona_name: str) -> Dict:
+        """Build persona_config structure for an agent."""
+        # Try to match persona_name to default or user personas
+        persona_id = None
+        source = "default"
+        
+        # Check default personas
+        if DEFAULT_PERSONAS_PATH.exists():
+            try:
+                with open(DEFAULT_PERSONAS_PATH, 'r', encoding='utf-8') as f:
+                    default_personas = json.load(f)
+                    for p in default_personas:
+                        if p.get("name") == persona_name:
+                            persona_id = p.get("id")
+                            source = "default"
+                            break
+            except Exception:
+                pass
+        
+        # Check user personas if not found in defaults
+        if not persona_id and USER_PERSONAS_PATH.exists():
+            try:
+                with open(USER_PERSONAS_PATH, 'r', encoding='utf-8') as f:
+                    user_personas = json.load(f)
+                    for p in user_personas:
+                        if p.get("name") == persona_name:
+                            persona_id = p.get("id")
+                            source = "user_custom"
+                            break
+            except Exception:
+                pass
+        
+        # Fallback to legacy persona system
+        if not persona_id:
+            persona_prompt = self._persona_prompt(persona_name)
+            if persona_prompt:
+                return {
+                    "source": "one_time",
+                    "id": None,
+                    "one_time_prompt": persona_prompt
+                }
+            else:
+                return {
+                    "source": "default",
+                    "id": None,
+                    "one_time_prompt": ""
+                }
+        
+        return {
+            "source": source,
+            "id": persona_id,
+            "one_time_prompt": ""
+        }
+    
+    def _prepare_discussion_tabs(self, selected: List[str]):
+        """Prepare UI tabs for discussion mode."""
+        # Clear existing tabs
+        self.tabs.clear()
+        self.model_tabs.clear()
+        self.model_texts.clear()
+        
+        # Create discussion view tab
+        discussion_page = QtWidgets.QWidget()
+        discussion_layout = QtWidgets.QVBoxLayout(discussion_page)
+        
+        # Switch to QTextBrowser for markdown/HTML
+        self.discussion_view = QtWidgets.QTextBrowser()
+        self.discussion_view.setOpenExternalLinks(True)
+        self.discussion_view.setReadOnly(True)
+        discussion_layout.addWidget(self.discussion_view)
+        
+        # Export button for discussion
+        export_layout = QtWidgets.QHBoxLayout()
+        export_btn = QtWidgets.QPushButton("Export Discussion")
+        export_btn.clicked.connect(self._export_discussion)
+        export_layout.addStretch(1)
+        export_layout.addWidget(export_btn)
+        discussion_layout.addLayout(export_layout)
+        
+        self.tabs.addTab(discussion_page, "Live Discussion")
+        self.model_tabs["_DISCUSSION_"] = discussion_page
+        self.model_texts["_DISCUSSION_"] = self.discussion_view
+        
+        # Initialize discussion transcript storage
+        self.discussion_transcript = []
+        
+        # Create final report tab
+        report_page = QtWidgets.QWidget()
+        report_layout = QtWidgets.QVBoxLayout(report_page)
+        # Switch to QTextBrowser
+        self.report_view = QtWidgets.QTextBrowser()
+        self.report_view.setOpenExternalLinks(True)
+        self.report_view.setReadOnly(True)
+        report_layout.addWidget(self.report_view)
+        self.tabs.addTab(report_page, "Final Report")
+        self.model_tabs["_REPORT_"] = report_page
+        self.model_texts["_REPORT_"] = self.report_view
+    
+    def _update_discussion_view(self, entry: Dict):
+        """Update the discussion view in real-time as each agent responds."""
+        if not hasattr(self, 'discussion_view') or not self.discussion_view:
+            return
+        
+        # Add entry to transcript
+        self.discussion_transcript.append(entry)
+        
+        # Format and update the view
+        agent = entry.get("agent", "Unknown")
+        persona = entry.get("persona")
+        message = entry.get("message", "")
+        turn = entry.get("turn", 0)
+        
+        # Include persona label if available
+        if persona:
+            agent_label = f"{agent} <span style='color: #666; font-size: 0.9em;'>[{persona}]</span>"
+        else:
+            agent_label = agent
+        
+        # Style for discussion bubbles
+        style = "margin: 5px 0; padding: 10px; border-radius: 8px; background-color: #f9f9f9; border: 1px solid #eee; color: #000000;"
+        
+        # Convert message to markdown
+        msg_html = markdown.markdown(message)
+        
+        new_html = f"""
+        <div style="{style}">
+            <div style="font-weight: bold; margin-bottom: 5px; color: #333;">[Turn {turn}] {agent_label}</div>
+            <div>{msg_html}</div>
+        </div>
+        """
+        
+        # Append to existing content
+        self.discussion_view.append(new_html)
+        
+        # Auto-scroll to bottom
+        self.discussion_view.verticalScrollBar().setValue(
+            self.discussion_view.verticalScrollBar().maximum()
+        )
+    
+    def _export_discussion(self):
+        """Export the current discussion to a Markdown file."""
+        if not hasattr(self, 'discussion_transcript') or not self.discussion_transcript:
+            QtWidgets.QMessageBox.information(self, "No Data", "No discussion data to export.")
+            return
+            
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Export Discussion", "discussion_report.md", "Markdown Files (*.md);;All Files (*)"
+        )
+        
+        if not file_path:
+            return
+            
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write("# PolyCouncil Discussion Report\n\n")
+                f.write(f"**Date:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"**Question:** {self.prompt_edit.text() if hasattr(self, 'prompt_edit') and self.prompt_edit.text() else 'N/A'}\n\n")
+                
+                f.write("## Transcript\n\n")
+                for entry in self.discussion_transcript:
+                    agent = entry.get("agent", "Unknown")
+                    persona = entry.get("persona")
+                    message = entry.get("message", "")
+                    turn = entry.get("turn", 0)
+                    
+                    agent_label = f"{agent} [{persona}]" if persona else agent
+                    
+                    f.write(f"### Turn {turn}: {agent_label}\n\n")
+                    f.write(f"{message}\n\n")
+                    f.write("---\n\n")
+                
+                # Include synthesis if available (extract from report view text)
+                if hasattr(self, 'report_view') and self.report_view:
+                    report_content = self.report_view.toPlainText()
+                    if "=== FINAL SYNTHESIS ===" in report_content:
+                        synthesis_part = report_content.split("=== FINAL SYNTHESIS ===")[1].strip()
+                        f.write("## Final Synthesis\n\n")
+                        f.write(f"{synthesis_part}\n")
+            
+            self._set_status(f"Discussion exported to {Path(file_path).name}")
+            
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Export Error", f"Failed to export discussion: {str(e)}")
 
     def _handle_error(self, msg: str):
         self._busy(False)
@@ -1571,13 +2380,27 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
     def _handle_result(self, payload: object):
         self._busy(False)
+        
+        # Check if this is a discussion mode result
+        if isinstance(payload, tuple) and len(payload) > 0 and payload[0] == "discussion":
+            self._handle_discussion_result(payload)
+        else:
+            self._handle_deliberation_result(payload)
+    
+    def _handle_deliberation_result(self, payload: object):
+        """Handle result from Deliberation Mode."""
         question, answers, winner, details, tally = payload
 
         # Fill each model tab with its answer
         for mid, txtw in self.model_texts.items():
             if mid == "_RESULTS_":
                 continue
-            txtw.setPlainText(answers.get(mid, ""))
+            # If it's a QPlainTextEdit (legacy tabs), update text. If QTextBrowser, use setHtml
+            if isinstance(txtw, QtWidgets.QTextBrowser):
+                html = markdown.markdown(answers.get(mid, ""))
+                txtw.setHtml(html)
+            else:
+                txtw.setPlainText(answers.get(mid, ""))
 
         # Refresh leaderboard list
         self._refresh_leaderboard()
@@ -1618,12 +2441,77 @@ class CouncilWindow(QtWidgets.QMainWindow):
             for voter, msg in vote_messages.items():
                 lines.append(f"  {short_id(voter)} → {msg}")
 
+        # Results tab is QPlainTextEdit, not QTextBrowser, so use setPlainText
         self.model_texts["_RESULTS_"].setPlainText("\n".join(lines))
 
         # Show winning answer in chat
         ans = answers.get(winner, "")
         self._append_chat(f"Council → {short_id(winner)}:\n{ans}")
         self._set_status("Done.")
+    
+    def _handle_discussion_result(self, payload: object):
+        """Handle result from Collaborative Discussion Mode."""
+        mode, question, transcript, synthesis = payload
+        
+        # Display transcript in discussion view
+        if hasattr(self, 'discussion_view') and self.discussion_view:
+            transcript_text = []
+            for entry in transcript:
+                agent = entry.get("agent", "Unknown")
+                persona = entry.get("persona")
+                message = entry.get("message", "")
+                turn = entry.get("turn", 0)
+                
+                # Include persona label if available
+                if persona:
+                    agent_label = f"{agent} [{persona}]"
+                else:
+                    agent_label = agent
+                
+                transcript_text.append(f"[Turn {turn}] {agent_label}:\n{message}\n")
+            
+            self.discussion_view.setPlainText("\n".join(transcript_text))
+        
+        # Display synthesis in report view
+        if hasattr(self, 'report_view') and self.report_view:
+            report_text = f"""=== COLLABORATIVE DISCUSSION REPORT ===
+
+Question: {question}
+
+=== DISCUSSION TRANSCRIPT ===
+
+"""
+            for entry in transcript:
+                agent = entry.get("agent", "Unknown")
+                persona = entry.get("persona")
+                message = entry.get("message", "")
+                turn = entry.get("turn", 0)
+                
+                # Include persona label if available
+                if persona:
+                    agent_label = f"{agent} [{persona}]"
+                else:
+                    agent_label = agent
+                
+                report_text += f"[Turn {turn}] {agent_label}:\n{message}\n\n"
+            
+            report_text += f"""
+=== FINAL SYNTHESIS ===
+
+{synthesis if synthesis and synthesis.strip() else "Synthesis not available. The synthesis may have failed to generate or was empty."}
+
+"""
+            self.report_view.setPlainText(report_text)
+        
+        # Show summary in chat
+        self._append_chat(f"Discussion complete. {len(transcript)} turns recorded.")
+        if synthesis and synthesis.strip():
+            # Show full synthesis in chat (no truncation)
+            self._append_chat(f"Final Synthesis:\n{synthesis}")
+        elif synthesis is None:
+            self._append_chat("Note: Synthesis generation failed. Check console for details.")
+        
+        self._set_status("Discussion complete.")
 
 # -----------------------
 # Entry point
