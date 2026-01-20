@@ -175,18 +175,26 @@ def load_settings() -> dict:
         "persona_assignments": {},
     }
 
+# Thread lock for settings to prevent race conditions
+_settings_lock = threading.Lock()
+
 def save_settings(s: dict):
-    try:
-        current = {}
-        if SETTINGS_PATH.exists():
-            try:
-                current = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-            except Exception:
-                current = {}
-        current.update(s or {})
-        SETTINGS_PATH.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
-    except Exception:
-        pass
+    """Thread-safe settings persistence with proper error handling."""
+    with _settings_lock:
+        try:
+            current = {}
+            if SETTINGS_PATH.exists():
+                try:
+                    current = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+                except json.JSONDecodeError as e:
+                    print(f"Warning: Settings file corrupted, starting fresh: {e}")
+                    current = {}
+            current.update(s or {})
+            SETTINGS_PATH.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
+        except PermissionError as e:
+            print(f"Error: Cannot write settings (permission denied): {e}")
+        except Exception as e:
+            print(f"Warning: Failed to save settings: {e}")
 
 # -----------------------
 # Database (leaderboard)
@@ -605,14 +613,15 @@ async def council_round(
                 totals[candidate_mid] = totals.get(candidate_mid, 0) + int(weighted)
 
         if not valid_votes:
-            status_cb("⚠ NO VALID VOTES - selecting first model by default")
+            status_cb("⚠ NO VALID VOTES - selecting first model by default (consider checking model compatibility)")
             winner = selected_models[0]
         else:
             max_score = max(totals.values())
             contenders = [m for m, score in totals.items() if score == max_score]
             if len(contenders) > 1:
-                winner = min(contenders, key=lambda m: selected_models.index(m))
-                status_cb(f"Tie between {len(contenders)} models, selected by order: {short_id(winner)}")
+                # Use random selection instead of positional bias to ensure fairness
+                winner = random.choice(contenders)
+                status_cb(f"Tie between {len(contenders)} models, randomly selected: {short_id(winner)}")
             else:
                 winner = contenders[0]
 
@@ -787,9 +796,10 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.conc_spin = QtWidgets.QSpinBox()
         self.conc_spin.setRange(1, 8)
         self.conc_spin.setValue(1)
-        self.conc_warn = QtWidgets.QLabel("Warning: higher values can slow the app dramatically on modest hardware.")
+        self.conc_warn = QtWidgets.QLabel("⚠ Higher values may slow the app on modest hardware")
         self.conc_warn.setWordWrap(True)
         self.conc_warn.setStyleSheet("color: #a12;")
+        self.conc_warn.setVisible(False)  # Only show when concurrency > 2
         conc_row = QtWidgets.QHBoxLayout()
         conc_row.addWidget(self.conc_label)
         conc_row.addWidget(self.conc_spin)
@@ -1015,6 +1025,27 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.log_signal.connect(self._append_log)
         self.discussion_update_signal.connect(self._update_discussion_view)
         self.capability_update_signal.connect(self._update_capability_ui)
+        
+        # Keyboard shortcuts
+        self._setup_keyboard_shortcuts()
+    
+    def _setup_keyboard_shortcuts(self):
+        """Setup keyboard shortcuts for common actions."""
+        # Ctrl+Enter to send (alternative to Enter in prompt)
+        send_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Return"), self)
+        send_shortcut.activated.connect(self._send)
+        
+        # Ctrl+Shift+A to select all models (Ctrl+A is used by text fields)
+        select_all_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+Shift+A"), self)
+        select_all_shortcut.activated.connect(self._select_all_models)
+        
+        # Ctrl+R to refresh models
+        refresh_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+R"), self)
+        refresh_shortcut.activated.connect(self._refresh_models_clicked)
+        
+        # Escape to stop current operation
+        stop_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Escape"), self)
+        stop_shortcut.activated.connect(self._stop_process)
 
     # ----- actions -----
     def _update_persona_combo_visibility(self):
@@ -1244,6 +1275,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
     def _concurrency_changed(self, value: int):
         save_settings({"max_concurrency": int(value)})
+        # Show warning only when concurrency is high enough to potentially cause issues
+        self.conc_warn.setVisible(value > 2)
 
     def _open_settings_dialog(self):
         dialog = QtWidgets.QDialog(self)
@@ -1793,8 +1826,11 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
     def _refresh_leaderboard(self):
         self.leader_list.clear()
-        for mid, count in load_leaderboard():
-            self.leader_list.addItem(f"{short_id(mid)} — {count} wins")
+        leaderboard = load_leaderboard()
+        total_wins = sum(count for _, count in leaderboard)
+        for mid, count in leaderboard:
+            pct = (count / total_wins * 100) if total_wins > 0 else 0
+            self.leader_list.addItem(f"{short_id(mid)} — {count} wins ({pct:.0f}%)")
 
     # ----- UI helpers -----
     def _prepare_tabs(self, selected_models: List[str]):
@@ -2111,7 +2147,13 @@ class CouncilWindow(QtWidgets.QMainWindow):
         def worker():
             try:
                 self._stop_requested = False
-                voters = [single_voter_model] if (single_voter_enabled and single_voter_model) else None
+                voters = None
+                if single_voter_enabled and single_voter_model:
+                    # Validate that single voter model is available
+                    if single_voter_model in self.models:
+                        voters = [single_voter_model]
+                    else:
+                        self.status_signal.emit(f"⚠ Single voter '{short_id(single_voter_model)}' not available, using all models as voters")
                 answers, winner, details, tally = asyncio.run(
                     council_round(
                         base, selected, question, roles_map, self.status_signal.emit,

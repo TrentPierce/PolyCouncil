@@ -590,17 +590,49 @@ Summary:"""
     
     def _check_consensus(self, history: List[Dict]) -> bool:
         """
-        Simple heuristic to check if consensus is reached.
-        Can be enhanced with more sophisticated logic.
+        Heuristic to check if consensus is reached based on message content.
+        Looks for convergence signals in recent messages.
         """
         if len(history) < 3:
             return False
         
-        # Check if last few messages indicate convergence
-        recent = history[-3:]
-        # Simple check: if we have enough turns, consider it done
-        # This can be made more sophisticated
-        return self.turn_count >= 5
+        # Get recent messages (last 3-4 entries depending on agent count)
+        recent_messages = [e.get('message', '').lower() for e in history[-4:]]
+        
+        # Consensus/agreement indicators
+        consensus_phrases = [
+            'agree', 'consensus', 'conclude', 'in conclusion', 'summary',
+            'we have reached', 'final answer', 'to summarize', 'all things considered',
+            'the best approach', 'recommend', 'settled on', 'converge'
+        ]
+        
+        # Disagreement indicators (if present, not yet consensus)
+        disagreement_phrases = [
+            'disagree', 'however', 'on the other hand', 'but i think',
+            'counterpoint', 'alternatively', 'i would argue'
+        ]
+        
+        # Count signals
+        consensus_signals = sum(
+            1 for msg in recent_messages 
+            for phrase in consensus_phrases 
+            if phrase in msg
+        )
+        
+        disagreement_signals = sum(
+            1 for msg in recent_messages 
+            for phrase in disagreement_phrases 
+            if phrase in msg
+        )
+        
+        # Consensus reached if:
+        # - We have multiple consensus signals and few disagreements, OR
+        # - We've reached max turns
+        if consensus_signals >= 2 and disagreement_signals <= 1:
+            return True
+        
+        # Always stop at max turns
+        return self.turn_count >= self.max_turns
     
     async def _generate_synthesis(
         self,
