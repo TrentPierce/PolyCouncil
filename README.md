@@ -123,7 +123,7 @@ python council.py
   - PySide6 (GUI framework)
   - aiohttp (async HTTP client)
   - requests (HTTP library)
-  - qdarktheme (optional, for theme support)
+  - pyinstaller (build tooling)
 
 ---
 
@@ -320,6 +320,13 @@ Special thanks to:
 - **Have a feature request?** [Open an issue](https://github.com/TrentPierce/PolyCouncil/issues)
 - **Need help?** Check existing issues or open a new one
 - **Like the project?** Star it on GitHub!
+
+## Release Notes
+
+- [v1.1.1](docs/releases/RELEASE_NOTES_v1.1.1.md)
+- [v1.1.0](docs/releases/RELEASE_NOTES_v1.1.0.md)
+- [v1.0.1](docs/releases/RELEASE_NOTES_v1.0.1.md)
+- [v1.0.0](docs/releases/RELEASE_NOTES_v1.0.0.md)
 
 ---
 
