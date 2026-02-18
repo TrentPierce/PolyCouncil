@@ -8,7 +8,6 @@ import json
 import mimetypes
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
-import requests
 import aiohttp
 
 # Try to import file parsing libraries
@@ -117,94 +116,81 @@ class FileParser:
 
 
 class ModelCapabilityDetector:
-    """Detects model capabilities from LM Studio API responses."""
-    
+    """Detects model capabilities from OpenAI-compatible model metadata."""
+
+    @staticmethod
+    async def fetch_models_data(
+        session: aiohttp.ClientSession,
+        base_url: str,
+        api_key: str = "",
+        model_path: str = "v1/models",
+    ) -> dict:
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        models_url = f"{base_url.rstrip('/')}/{model_path.lstrip('/')}"
+        async with session.get(models_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                return {}
+            return await resp.json()
+
+    @staticmethod
+    def _find_model_entry(models_data: dict, model: str) -> Optional[dict]:
+        for item in models_data.get("data", []):
+            if item.get("id") == model or item.get("name") == model:
+                return item
+        return None
+
+    @staticmethod
+    def detect_web_search_from_data(models_data: dict, model: str) -> bool:
+        item = ModelCapabilityDetector._find_model_entry(models_data, model)
+        if not item:
+            return False
+        capabilities = item.get("capabilities", {})
+        if isinstance(capabilities, dict):
+            if capabilities.get("web_search") or capabilities.get("tools"):
+                return True
+        model_name = (item.get("id") or item.get("name") or "").lower()
+        if "search" in model_name or "tool" in model_name:
+            return True
+        model_info = item.get("info", {})
+        if isinstance(model_info, dict):
+            if model_info.get("supports_tools") or model_info.get("supports_functions"):
+                return True
+        return False
+
+    @staticmethod
+    def detect_visual_from_data(models_data: dict, model: str) -> bool:
+        item = ModelCapabilityDetector._find_model_entry(models_data, model)
+        if not item:
+            return False
+        capabilities = item.get("capabilities", {})
+        if isinstance(capabilities, dict):
+            if capabilities.get("vision") or capabilities.get("visual") or capabilities.get("multimodal"):
+                return True
+        model_name = (item.get("id") or item.get("name") or "").lower()
+        if any(keyword in model_name for keyword in ["vision", "visual", "multimodal", "clip", "llava", "vl"]):
+            return True
+        model_info = item.get("info", {})
+        if isinstance(model_info, dict):
+            if model_info.get("supports_vision") or model_info.get("supports_images"):
+                return True
+        return False
+
     @staticmethod
     async def detect_web_search(session: aiohttp.ClientSession, base_url: str, model: str) -> bool:
-        """
-        Detect if the model supports web search tools.
-        
-        Args:
-            session: aiohttp session
-            base_url: LM Studio base URL
-            model: Model identifier
-            
-        Returns:
-            True if web search is supported, False otherwise
-        """
         try:
-            # Check model metadata from /v1/models endpoint
-            models_url = f"{base_url.rstrip('/')}/v1/models"
-            async with session.get(models_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for item in data.get("data", []):
-                        if item.get("id") == model or item.get("name") == model:
-                            # Check for tool/function definitions
-                            capabilities = item.get("capabilities", {})
-                            if isinstance(capabilities, dict):
-                                if capabilities.get("web_search") or capabilities.get("tools"):
-                                    return True
-                            
-                            # Check model name for common patterns
-                            model_name = (item.get("id") or item.get("name") or "").lower()
-                            if "search" in model_name or "tool" in model_name:
-                                return True
-                            
-                            # Check for function calling in model info
-                            model_info = item.get("info", {})
-                            if isinstance(model_info, dict):
-                                if model_info.get("supports_tools") or model_info.get("supports_functions"):
-                                    return True
-            
-            # Try a test call to see if tools are available
-            # This is a lightweight check
-            return False
-            
+            data = await ModelCapabilityDetector.fetch_models_data(session, base_url)
+            return ModelCapabilityDetector.detect_web_search_from_data(data, model)
         except Exception as e:
             print(f"Error detecting web search for {model}: {e}")
             return False
     
     @staticmethod
     async def detect_visual(session: aiohttp.ClientSession, base_url: str, model: str) -> bool:
-        """
-        Detect if the model supports visual/image inputs.
-        
-        Args:
-            session: aiohttp session
-            base_url: LM Studio base URL
-            model: Model identifier
-            
-        Returns:
-            True if visual inputs are supported, False otherwise
-        """
         try:
-            # Check model metadata
-            models_url = f"{base_url.rstrip('/')}/v1/models"
-            async with session.get(models_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for item in data.get("data", []):
-                        if item.get("id") == model or item.get("name") == model:
-                            # Check capabilities
-                            capabilities = item.get("capabilities", {})
-                            if isinstance(capabilities, dict):
-                                if capabilities.get("vision") or capabilities.get("visual") or capabilities.get("multimodal"):
-                                    return True
-                            
-                            # Check model name for common patterns
-                            model_name = (item.get("id") or item.get("name") or "").lower()
-                            if any(keyword in model_name for keyword in ["vision", "visual", "multimodal", "clip", "llava", "vl"]):
-                                return True
-                            
-                            # Check model info
-                            model_info = item.get("info", {})
-                            if isinstance(model_info, dict):
-                                if model_info.get("supports_vision") or model_info.get("supports_images"):
-                                    return True
-            
-            return False
-            
+            data = await ModelCapabilityDetector.fetch_models_data(session, base_url)
+            return ModelCapabilityDetector.detect_visual_from_data(data, model)
         except Exception as e:
             print(f"Error detecting visual capabilities for {model}: {e}")
             return False

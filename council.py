@@ -14,8 +14,9 @@ import threading
 import re
 import random
 import uuid
+import traceback
 import markdown  # type: ignore
-import base64
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, List, Callable, Awaitable, Any, Iterable, Tuple
 
@@ -24,13 +25,12 @@ from PySide6 import QtCore, QtGui, QtWidgets
 # Import new core modules
 try:
     from core.tool_manager import FileParser, ModelCapabilityDetector
-    from core.discussion_manager import DiscussionManager, CORE_SYSTEM_INSTRUCTION
+    from core.discussion_manager import DiscussionManager
 except ImportError:
     # Fallback if modules not found
     FileParser = None
     ModelCapabilityDetector = None
     DiscussionManager = None
-    CORE_SYSTEM_INSTRUCTION = ""
 
 # Try optional theming (follows system)
 try:
@@ -158,14 +158,66 @@ SETTINGS_PATH = APP_DIR / "council_settings.json"
 DEFAULT_PERSONAS_PATH = APP_DIR / "config" / "default_personas.json"
 USER_PERSONAS_PATH = APP_DIR / "config" / "user_personas.json"
 
+PROVIDER_LM_STUDIO = "lm_studio"
+PROVIDER_OPENAI_COMPAT = "openai_compatible"
+PROVIDER_OLLAMA = "ollama"
+
+PROVIDER_LABELS = {
+    PROVIDER_LM_STUDIO: "LM Studio (OpenAI-compatible)",
+    PROVIDER_OPENAI_COMPAT: "OpenAI-compatible API",
+    PROVIDER_OLLAMA: "Ollama",
+}
+
+API_SERVICE_CUSTOM = "custom"
+API_SERVICE_OPENAI = "openai"
+API_SERVICE_OPENROUTER = "openrouter"
+API_SERVICE_GEMINI = "gemini"
+
+API_SERVICE_LABELS = {
+    API_SERVICE_CUSTOM: "Custom",
+    API_SERVICE_OPENAI: "OpenAI",
+    API_SERVICE_OPENROUTER: "OpenRouter",
+    API_SERVICE_GEMINI: "Google Gemini",
+}
+
+API_SERVICE_PRESETS = {
+    API_SERVICE_CUSTOM: {"base_url": "", "model_path": ""},
+    API_SERVICE_OPENAI: {"base_url": "https://api.openai.com", "model_path": "v1/models"},
+    API_SERVICE_OPENROUTER: {"base_url": "https://openrouter.ai/api/v1", "model_path": "models"},
+    API_SERVICE_GEMINI: {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "model_path": "models"},
+}
+
+
+@dataclass
+class ProviderConfig:
+    provider_type: str
+    base_url: str
+    api_key: str = ""
+    model_path: str = ""
+    api_service: str = API_SERVICE_CUSTOM
+
 def load_settings() -> dict:
     if SETTINGS_PATH.exists():
         try:
-            return json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            loaded = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            provider_type = loaded.get("provider_type", PROVIDER_LM_STUDIO)
+            if provider_type == PROVIDER_OLLAMA:
+                loaded.setdefault("base_url", "http://localhost:11434")
+            else:
+                loaded.setdefault("base_url", "http://localhost:1234")
+            loaded.setdefault("provider_type", provider_type)
+            loaded.setdefault("api_key", "")
+            loaded.setdefault("model_path", "")
+            loaded.setdefault("api_service", API_SERVICE_CUSTOM)
+            return loaded
         except Exception:
             pass
     return {
+        "provider_type": PROVIDER_LM_STUDIO,
         "base_url": "http://localhost:1234",
+        "api_key": "",
+        "model_path": "",
+        "api_service": API_SERVICE_CUSTOM,
         "debug": False,
         "single_voter_enabled": False,
         "single_voter_model": "",
@@ -195,6 +247,15 @@ def save_settings(s: dict):
             print(f"Error: Cannot write settings (permission denied): {e}")
         except Exception as e:
             print(f"Warning: Failed to save settings: {e}")
+
+def log_unhandled_exception(exc_type, exc_value, exc_tb):
+    try:
+        ts = datetime.datetime.now().isoformat(timespec="seconds")
+        tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        log_path = APP_DIR / "polycouncil_crash.log"
+        log_path.write_text(f"[{ts}] Unhandled exception\n{tb_text}\n", encoding="utf-8")
+    except Exception:
+        pass
 
 # -----------------------
 # Database (leaderboard)
@@ -238,28 +299,132 @@ def load_leaderboard() -> List[tuple[str, int]]:
         return []
 
 # -----------------------
-# LM Studio helpers
+# Provider helpers
 # -----------------------
-def endpoints(base_url: str):
-    b = base_url.rstrip("/")
+def provider_label(provider_type: str) -> str:
+    return PROVIDER_LABELS.get(provider_type, provider_type)
+
+def api_service_label(service: str) -> str:
+    return API_SERVICE_LABELS.get(service, API_SERVICE_LABELS[API_SERVICE_CUSTOM])
+
+def normalize_api_service(service: str) -> str:
+    if service in API_SERVICE_LABELS:
+        return service
+    return API_SERVICE_CUSTOM
+
+def service_preset(service: str) -> dict:
+    return dict(API_SERVICE_PRESETS.get(normalize_api_service(service), API_SERVICE_PRESETS[API_SERVICE_CUSTOM]))
+
+
+def normalize_provider_type(provider_type: str) -> str:
+    if provider_type in (PROVIDER_LM_STUDIO, PROVIDER_OPENAI_COMPAT, PROVIDER_OLLAMA):
+        return provider_type
+    return PROVIDER_LM_STUDIO
+
+
+def provider_defaults(provider_type: str) -> tuple[str, str]:
+    provider_type = normalize_provider_type(provider_type)
+    if provider_type == PROVIDER_OLLAMA:
+        return "http://localhost:11434", "model"
+    return "http://localhost:1234", "v1/models"
+
+
+def make_provider_config(
+    provider_type: str,
+    base_url: str,
+    api_key: str = "",
+    model_path: str = "",
+    api_service: str = API_SERVICE_CUSTOM,
+) -> ProviderConfig:
+    default_base, default_model_path = provider_defaults(provider_type)
+    normalized_type = normalize_provider_type(provider_type)
+    normalized_service = normalize_api_service(api_service)
+    preset = service_preset(normalized_service) if normalized_type == PROVIDER_OPENAI_COMPAT else {"base_url": "", "model_path": ""}
+    normalized_base = (base_url or default_base).strip()
+    if normalized_type == PROVIDER_OPENAI_COMPAT and normalized_service != API_SERVICE_CUSTOM and not base_url.strip():
+        normalized_base = preset["base_url"]
+    normalized_path = (model_path or default_model_path).strip().lstrip("/")
+    if normalized_type == PROVIDER_OPENAI_COMPAT and normalized_service != API_SERVICE_CUSTOM and not model_path.strip():
+        normalized_path = preset["model_path"]
+    if normalized_type == PROVIDER_LM_STUDIO:
+        normalized_path = "v1/models"
+    elif normalized_type == PROVIDER_OLLAMA:
+        normalized_path = "model"
+    return ProviderConfig(
+        provider_type=normalized_type,
+        base_url=normalized_base,
+        api_key=(api_key or "").strip(),
+        model_path=normalized_path,
+        api_service=normalized_service,
+    )
+
+
+def request_headers(provider: ProviderConfig) -> dict:
+    headers = {"Content-Type": "application/json"}
+    if provider.provider_type == PROVIDER_OPENAI_COMPAT and provider.api_key:
+        headers["Authorization"] = f"Bearer {provider.api_key}"
+    if provider.provider_type == PROVIDER_OPENAI_COMPAT and provider.api_service == API_SERVICE_OPENROUTER:
+        headers.setdefault("HTTP-Referer", "https://github.com/TrentPierce/PolyCouncil")
+        headers.setdefault("X-Title", "PolyCouncil")
+    return headers
+
+
+def endpoints(provider: ProviderConfig):
+    b = provider.base_url.rstrip("/")
+    if provider.provider_type == PROVIDER_LM_STUDIO:
+        return {
+            "chat": f"{b}/v1/chat/completions",
+            "models": f"{b}/v1/models",
+        }
+    if provider.provider_type == PROVIDER_OLLAMA:
+        return {
+            "chat": f"{b}/api/chat",
+            "models": f"{b}/api/tags",
+        }
+    model_path = provider.model_path or "v1/models"
+    lower = b.lower()
+    has_versioned_base = (
+        lower.endswith("/v1")
+        or lower.endswith("/v1beta")
+        or lower.endswith("/v1beta/openai")
+        or lower.endswith("/openai")
+        or lower.endswith("/api/v1")
+    )
+    if has_versioned_base:
+        chat_url = f"{b}/chat/completions"
+        models_url = f"{b}/{(model_path or 'models').lstrip('/')}"
+    else:
+        chat_url = f"{b}/v1/chat/completions"
+        models_url = f"{b}/{model_path}"
     return {
-        "chat":   f"{b}/v1/chat/completions",
-        "models": f"{b}/v1/models",
+        "chat": chat_url,
+        "models": models_url,
     }
 
-def fetch_models_from_lmstudio(base_url: str) -> List[str]:
+
+def parse_models_response(provider: ProviderConfig, data: dict) -> List[str]:
+    ids: List[str] = []
+    if provider.provider_type == PROVIDER_OLLAMA:
+        for item in data.get("models", []):
+            name = item.get("name")
+            if name:
+                ids.append(str(name))
+        return sorted(set(ids))
+    for item in data.get("data", []):
+        mid = item.get("id") or item.get("name")
+        if mid:
+            ids.append(str(mid))
+    return sorted(set(ids))
+
+
+def fetch_models(provider: ProviderConfig) -> List[str]:
     try:
-        r = requests.get(endpoints(base_url)["models"], timeout=10)
+        r = requests.get(endpoints(provider)["models"], headers=request_headers(provider), timeout=10)
         r.raise_for_status()
         data = r.json()
-        ids = []
-        for item in data.get("data", []):
-            mid = item.get("id") or item.get("name")
-            if mid:
-                ids.append(mid)
-        return sorted(set(ids))
+        return parse_models_response(provider, data)
     except Exception as e:
-        print("fetch_models_from_lmstudio error:", e)
+        print(f"fetch_models error [{provider.provider_type}]:", e)
         return []
 
 # -----------------------
@@ -280,47 +445,61 @@ async def run_limited(max_concurrency: int, callables: Iterable[Callable[[], Awa
 # -----------------------
 async def call_model(
     session: aiohttp.ClientSession,
-    base_url: str,
+    provider: ProviderConfig,
     model: str,
     user_prompt: str,
     temperature: float = 0.2,
     sys_prompt: Optional[str] = None,
     json_schema: Optional[dict] = None,
     timeout_sec: int = 120,
-    images: List[str] = [],
+    images: Optional[List[str]] = None,
     web_search: bool = False
 ) -> Any:
     """
-    Calls LM Studio's OpenAI-compatible chat API.
+    Calls the selected provider API.
     If json_schema is provided, uses response_format={"type":"json_schema","json_schema":{...}}.
     Returns the content string from the first choice.
     """
-    url = endpoints(base_url)["chat"]
+    url = endpoints(provider)["chat"]
+    timeout = aiohttp.ClientTimeout(total=timeout_sec)
+    headers = request_headers(provider)
+    images = images or []
+
+    if provider.provider_type == PROVIDER_OLLAMA:
+        assembled_prompt = user_prompt if not sys_prompt else f"{sys_prompt}\n\n{user_prompt}"
+        payload = {
+            "model": model,
+            "stream": False,
+            "options": {"temperature": float(temperature)},
+            "messages": [{"role": "user", "content": assembled_prompt}],
+        }
+        _dbg("CALL payload", {"provider": provider.provider_type, "url": url, "payload": payload})
+        async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
+            txt = await resp.text()
+            if resp.status != 200:
+                raise RuntimeError(f"HTTP {resp.status} for {model}:\n{txt[:800]}")
+            try:
+                data = json.loads(txt)
+            except Exception as e:
+                raise RuntimeError(f"Non-JSON response for {model}:\n{txt[:800]}") from e
+            _dbg("CALL raw_response", data)
+            return data.get("message", {}).get("content", "")
+
     messages = []
     if sys_prompt:
         messages.append({"role": "system", "content": sys_prompt})
-    
-    # Handle multimodal content
+
     if images:
         content_list = [{"type": "text", "text": user_prompt}]
-        for img_b64 in images:
-            content_list.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
-            })
+        for image_url in images:
+            content_list.append({"type": "image_url", "image_url": {"url": image_url}})
         messages.append({"role": "user", "content": content_list})
     else:
         messages.append({"role": "user", "content": user_prompt})
 
-    payload = {
-        "model": model,
-        "messages": messages,
-        "temperature": float(temperature),
-    }
+    payload = {"model": model, "messages": messages, "temperature": float(temperature)}
     if json_schema:
         payload["response_format"] = {"type": "json_schema", "json_schema": json_schema}
-
-    # Inject Web Search Tools if enabled
     if web_search:
         payload["tools"] = [{
             "type": "function",
@@ -329,17 +508,14 @@ async def call_model(
                 "description": "Search the web for current information.",
                 "parameters": {
                     "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "The search query"}
-                    },
-                    "required": ["query"]
-                }
-            }
+                    "properties": {"query": {"type": "string", "description": "The search query"}},
+                    "required": ["query"],
+                },
+            },
         }]
 
-    _dbg("CALL payload", {"url": url, "payload": payload})
-    timeout=aiohttp.ClientTimeout(total=timeout_sec)
-    async with session.post(url, json=payload, timeout=timeout) as resp:
+    _dbg("CALL payload", {"provider": provider.provider_type, "url": url, "payload": payload})
+    async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
         txt = await resp.text()
         if resp.status != 200:
             raise RuntimeError(f"HTTP {resp.status} for {model}:\n{txt[:800]}")
@@ -461,21 +637,23 @@ def validate_ballot(idx_map_peer: Dict[int, str], ballot: dict) -> Tuple[bool, s
 # -----------------------
 async def vote_one(
     session: aiohttp.ClientSession,
-    base_url: str,
-    voter_model_id: str,
+    voter_entry: Dict[str, Any],
     question: str,
     answers: Dict[str, str],
-    selected_models: List[str],
+    model_entries: List[Dict[str, Any]],
 ) -> Tuple[str, Optional[dict], str]:
     """
     Ask a (voter) model to score peer answers and pick a winner.
     Returns: (voter_id, parsed_ballot, status_message)
     """
-    peer_models = [m for m in selected_models if m != voter_model_id]
-    idx_map_peer = {i + 1: m for i, m in enumerate(peer_models)}
+    voter_id = str(voter_entry["id"])
+    voter_raw_model = str(voter_entry["model"])
+    voter_provider = voter_entry["provider"]
+    peer_entries = [m for m in model_entries if str(m["id"]) != voter_id]
+    idx_map_peer = {i + 1: str(m["id"]) for i, m in enumerate(peer_entries)}
 
-    if not peer_models:
-        return voter_model_id, None, "No peer candidates to score."
+    if not peer_entries:
+        return voter_id, None, "No peer candidates to score."
 
     parts = [VOTE_INSTRUCTIONS, "", f"Question:\n{question}", "", "Candidates:"]
     for i, m in idx_map_peer.items():
@@ -486,12 +664,12 @@ async def vote_one(
     try:
         schema = ballot_json_schema(num_candidates=len(idx_map_peer))
         content = await call_model(
-            session, base_url, voter_model_id, prompt,
+            session, voter_provider, voter_raw_model, prompt,
             temperature=0.0,
             sys_prompt="Be precise. Return only JSON according to the schema.",
             json_schema=schema
         )
-        _dbg(f"VOTE raw OUTPUT json_schema (voter={voter_model_id})", content)
+        _dbg(f"VOTE raw OUTPUT json_schema (voter={voter_id})", content)
         parsed = safe_load_vote_json(content)
         if parsed:
             ok, msg = validate_ballot(idx_map_peer, parsed)
@@ -501,19 +679,19 @@ async def vote_one(
                     "final_pick": parsed.get("final_pick"),
                     "reasoning": parsed.get("reasoning", ""),
                 }
-                _dbg(f"VOTE ACCEPTED json_schema (voter={voter_model_id})", normalized)
-                return voter_model_id, normalized, f"Valid ballot via json_schema ({msg})"
+                _dbg(f"VOTE ACCEPTED json_schema (voter={voter_id})", normalized)
+                return voter_id, normalized, f"Valid ballot via json_schema ({msg})"
     except Exception as e:
-        _dbg(f"VOTE ERROR json_schema (voter={voter_model_id})", str(e))
+        _dbg(f"VOTE ERROR json_schema (voter={voter_id})", str(e))
 
     try:
         content = await call_model(
-            session, base_url, voter_model_id, prompt,
+            session, voter_provider, voter_raw_model, prompt,
             temperature=0.0,
             sys_prompt="Return only JSON for the ballot. No extra text.",
             json_schema=None
         )
-        _dbg(f"VOTE raw OUTPUT text (voter={voter_model_id})", content)
+        _dbg(f"VOTE raw OUTPUT text (voter={voter_id})", content)
         parsed = safe_load_vote_json(content)
         if parsed:
             ok, msg = validate_ballot(idx_map_peer, parsed)
@@ -523,28 +701,27 @@ async def vote_one(
                     "final_pick": parsed.get("final_pick"),
                     "reasoning": parsed.get("reasoning", ""),
                 }
-                _dbg(f"VOTE ACCEPTED text (voter={voter_model_id})", normalized)
-                return voter_model_id, normalized, f"Valid ballot via text ({msg})"
+                _dbg(f"VOTE ACCEPTED text (voter={voter_id})", normalized)
+                return voter_id, normalized, f"Valid ballot via text ({msg})"
             else:
-                _dbg(f"VOTE REJECTED text (voter={voter_model_id})", msg)
+                _dbg(f"VOTE REJECTED text (voter={voter_id})", msg)
     except Exception as e:
-        _dbg(f"VOTE ERROR text (voter={voter_model_id})", str(e))
+        _dbg(f"VOTE ERROR text (voter={voter_id})", str(e))
 
-    _dbg(f"VOTE FAILED ALL ATTEMPTS (voter={voter_model_id})", "No valid ballot produced")
-    return voter_model_id, None, f"Failed to obtain valid ballot from {short_id(voter_model_id)}"
+    _dbg(f"VOTE FAILED ALL ATTEMPTS (voter={voter_id})", "No valid ballot produced")
+    return voter_id, None, f"Failed to obtain valid ballot from {short_id(voter_id)}"
 
 # -----------------------
 # Council orchestration
 # -----------------------
 async def council_round(
-    base_url: str,
-    selected_models: List[str],
+    model_entries: List[Dict[str, Any]],
     question: str,
     roles: Dict[str, Optional[str]],
     status_cb: Callable[[str], None],
     max_concurrency: int = 1,
     voter_override: Optional[List[str]] = None,
-    images: List[str] = [],
+    images: Optional[List[str]] = None,
     web_search: bool = False,
     temperature: float = 0.7,
     is_cancelled: Optional[Callable[[], bool]] = None
@@ -552,7 +729,11 @@ async def council_round(
     status_cb("Collecting answers…")
     async with aiohttp.ClientSession() as session:
 
-        async def answer_one(model_id: str) -> tuple[str, str]:
+        images = images or []
+        async def answer_one(entry: Dict[str, Any]) -> tuple[str, str]:
+            model_id = str(entry["id"])
+            raw_model = str(entry["model"])
+            provider = entry["provider"]
             if is_cancelled and is_cancelled():
                 return model_id, "[Cancelled]"
             
@@ -560,7 +741,7 @@ async def council_round(
             sys_p = roles.get(model_id) or None
             try:
                 ans = await call_model(
-                    session, base_url, model_id, user_prompt, 
+                    session, provider, raw_model, user_prompt,
                     temperature=temperature, sys_prompt=sys_p, 
                     images=images, web_search=web_search
                 )
@@ -574,7 +755,7 @@ async def council_round(
         if is_cancelled and is_cancelled():
             raise RuntimeError("Process cancelled by user")
 
-        pairs = await run_limited(max_concurrency, [lambda m=m: answer_one(m) for m in selected_models])
+        pairs = await run_limited(max_concurrency, [lambda m=m: answer_one(m) for m in model_entries])
         
         # Check cancellation after answers
         if is_cancelled and is_cancelled():
@@ -585,11 +766,16 @@ async def council_round(
 
         status_cb("Models are voting…")
 
-        voters_to_use = voter_override if voter_override else selected_models
+        model_entry_by_id = {str(m["id"]): m for m in model_entries}
+        selected_model_ids = list(model_entry_by_id.keys())
+        voters_to_use = voter_override if voter_override else selected_model_ids
         # Note: Voting phase does not use images or web search, typically.
         vote_results = await run_limited(
             max_concurrency,
-            [lambda m=m: vote_one(session, base_url, m, question, answers, selected_models) for m in voters_to_use]
+            [
+                lambda m=m: vote_one(session, model_entry_by_id[m], question, answers, model_entries)
+                for m in voters_to_use if m in model_entry_by_id
+            ]
         )
 
         valid_votes: Dict[str, dict] = {}
@@ -606,7 +792,7 @@ async def council_round(
         if invalid_votes:
             status_cb(f"⚠ {len(invalid_votes)}/{len(voters_to_use)} invalid ballots: {', '.join(short_id(m) for m in invalid_votes)}")
 
-        totals: Dict[str, int] = {mid: 0 for mid in selected_models}
+        totals: Dict[str, int] = {mid: 0 for mid in selected_model_ids}
         for ballot in valid_votes.values():
             for candidate_mid, score_dict in ballot["scores"].items():
                 weighted = sum(score_dict[k] * RUBRIC_WEIGHTS[k] for k in RUBRIC_WEIGHTS.keys())
@@ -614,7 +800,7 @@ async def council_round(
 
         if not valid_votes:
             status_cb("⚠ NO VALID VOTES - selecting first model by default (consider checking model compatibility)")
-            winner = selected_models[0]
+            winner = selected_model_ids[0]
         else:
             max_score = max(totals.values())
             contenders = [m for m, score in totals.items() if score == max_score]
@@ -649,14 +835,14 @@ class ModelFetchWorker(QtCore.QObject):
     finished = QtCore.Signal(list)
     failed = QtCore.Signal(str)
 
-    def __init__(self, base_url: str):
+    def __init__(self, provider: ProviderConfig):
         super().__init__()
-        self.base_url = base_url
+        self.provider = provider
 
     @QtCore.Slot()
     def run(self):
         try:
-            models = fetch_models_from_lmstudio(self.base_url)
+            models = fetch_models(self.provider)
             self.finished.emit(models)
         except Exception as e:
             self.failed.emit(str(e))
@@ -692,16 +878,27 @@ class CouncilWindow(QtWidgets.QMainWindow):
         ensure_db()
 
         self.models: List[str] = []
+        self.model_actual_ids: Dict[str, str] = {}
+        self.model_provider_map: Dict[str, ProviderConfig] = {}
         self.model_checks: Dict[str, QtWidgets.QCheckBox] = {}
         self.model_tabs: Dict[str, QtWidgets.QWidget] = {}
         self.model_texts: Dict[str, QtWidgets.QPlainTextEdit] = {}
-        self.model_persona_combos: Dict[str, QtWidgets.QComboBox] = {}
+        self.model_persona_combos: Dict[str, QtWidgets.QPushButton] = {}
+        self.provider_type = PROVIDER_LM_STUDIO
+        self.api_key = ""
+        self.model_path = ""
+        self.api_service = API_SERVICE_CUSTOM
+        self.last_submitted_question = ""
+        self.provider_profiles: List[Dict[str, str]] = []
+        self.provider_profile_rows: Dict[str, QtWidgets.QWidget] = {}
         
         # New features
         self.mode = "deliberation"  # "deliberation" or "discussion"
         self.uploaded_files: List[Path] = []
         self.model_capabilities: Dict[str, Dict[str, bool]] = {}  # model -> {web_search: bool, visual: bool}
         self.web_search_enabled = False
+        self._fetch_append = False
+        self._fetch_provider: Optional[ProviderConfig] = None
 
         self._build_ui()
         self._setup_log_dock()
@@ -710,7 +907,34 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
         # restore settings
         s = load_settings()
-        self.base_edit.setText(s.get("base_url", "http://localhost:1234"))
+        self.provider_type = normalize_provider_type(s.get("provider_type", PROVIDER_LM_STUDIO))
+        self.api_key = s.get("api_key", "") or ""
+        self.model_path = s.get("model_path", "") or ""
+        self.api_service = normalize_api_service(s.get("api_service", API_SERVICE_CUSTOM))
+        default_base, _ = provider_defaults(self.provider_type)
+        self.base_edit.setText(s.get("base_url", default_base))
+        self.api_key_inline.setText(self.api_key)
+        self.provider_combo.setCurrentText(provider_label(self.provider_type))
+        self.api_service_combo.setCurrentText(api_service_label(self.api_service))
+        self._provider_changed(self.provider_combo.currentIndex())
+        loaded_profiles = s.get("provider_profiles", [])
+        if isinstance(loaded_profiles, list):
+            normalized_profiles: List[Dict[str, str]] = []
+            for p in loaded_profiles:
+                if not isinstance(p, dict):
+                    continue
+                normalized_profiles.append({
+                    "id": p.get("id") or str(uuid.uuid4()),
+                    "provider_type": normalize_provider_type(p.get("provider_type", PROVIDER_LM_STUDIO)),
+                    "api_service": normalize_api_service(p.get("api_service", API_SERVICE_CUSTOM)),
+                    "base_url": str(p.get("base_url", "")),
+                    "api_key": str(p.get("api_key", "")),
+                    "model_path": str(p.get("model_path", "")),
+                })
+            self.provider_profiles = normalized_profiles
+        if not self.provider_profiles:
+            self.provider_profiles = [self._current_profile_payload()]
+        self._render_provider_profiles()
 
         self.personas = self._merge_persona_library(s.get("personas", []))
         self.persona_assignments: Dict[str, str] = dict(s.get("persona_assignments", {}) or {})
@@ -782,9 +1006,32 @@ class CouncilWindow(QtWidgets.QMainWindow):
         top = QtWidgets.QHBoxLayout()
         top.setSpacing(10)
 
+        self.provider_combo = QtWidgets.QComboBox()
+        self.provider_combo.addItems([provider_label(PROVIDER_LM_STUDIO), provider_label(PROVIDER_OPENAI_COMPAT), provider_label(PROVIDER_OLLAMA)])
+        self.provider_combo.setMinimumWidth(230)
+        self.api_service_combo = QtWidgets.QComboBox()
+        self.api_service_combo.addItems([
+            api_service_label(API_SERVICE_CUSTOM),
+            api_service_label(API_SERVICE_OPENAI),
+            api_service_label(API_SERVICE_OPENROUTER),
+            api_service_label(API_SERVICE_GEMINI),
+        ])
+        self.api_service_combo.setMinimumWidth(170)
+        self.api_service_label = QtWidgets.QLabel("API Service:")
+
         self.base_edit = QtWidgets.QLineEdit()
         self.base_edit.setPlaceholderText("http://localhost:1234")
-        self.connect_btn = QtWidgets.QPushButton("Connect")
+        self.base_label = QtWidgets.QLabel("Base URL:")
+        self.api_key_inline_label = QtWidgets.QLabel("API Key:")
+        self.api_key_inline = QtWidgets.QLineEdit()
+        self.api_key_inline.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.api_key_inline.setPlaceholderText("Paste API key")
+        self.api_key_inline.setMinimumWidth(220)
+        self.show_key_check = QtWidgets.QCheckBox("Show")
+        self.connect_btn = QtWidgets.QPushButton("Add Models")
+        self.replace_models_btn = QtWidgets.QPushButton("Replace List")
+        self.connect_btn.setToolTip("Append models from selected provider to the existing list.")
+        self.replace_models_btn.setToolTip("Replace the current model list with models from selected provider.")
 
         # Single voter controls
         self.single_voter_check = QtWidgets.QCheckBox("Single-voter")
@@ -807,15 +1054,48 @@ class CouncilWindow(QtWidgets.QMainWindow):
         conc_box.addLayout(conc_row)
         conc_box.addWidget(self.conc_warn)
 
-        top.addWidget(QtWidgets.QLabel("LM Studio Base URL:"))
+        top.addWidget(QtWidgets.QLabel("Provider:"))
+        top.addWidget(self.provider_combo)
+        top.addWidget(self.api_service_label)
+        top.addWidget(self.api_service_combo)
+        top.addWidget(self.base_label)
         top.addWidget(self.base_edit, stretch=0)
+        top.addWidget(self.api_key_inline_label)
+        top.addWidget(self.api_key_inline)
+        top.addWidget(self.show_key_check)
         top.addWidget(self.connect_btn)
+        top.addWidget(self.replace_models_btn)
         top.addWidget(self.single_voter_check)
         top.addWidget(self.single_voter_combo)
         top.addStretch(1)
         top.addLayout(conc_box)
 
         layout.addLayout(top)
+
+        # Saved providers section
+        providers_group = QtWidgets.QGroupBox("Saved Providers")
+        providers_group_layout = QtWidgets.QVBoxLayout(providers_group)
+        providers_group_layout.setContentsMargins(8, 8, 8, 8)
+        providers_group_layout.setSpacing(6)
+
+        providers_header = QtWidgets.QHBoxLayout()
+        self.add_provider_btn = QtWidgets.QPushButton("Add Provider")
+        providers_header.addWidget(self.add_provider_btn)
+        providers_header.addStretch(1)
+        providers_group_layout.addLayout(providers_header)
+
+        self.providers_scroll = QtWidgets.QScrollArea()
+        self.providers_scroll.setWidgetResizable(True)
+        self.providers_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.providers_inner = QtWidgets.QWidget()
+        self.providers_layout = QtWidgets.QVBoxLayout(self.providers_inner)
+        self.providers_layout.setContentsMargins(0, 0, 0, 0)
+        self.providers_layout.setSpacing(4)
+        self.providers_layout.addStretch(1)
+        self.providers_scroll.setWidget(self.providers_inner)
+        providers_group_layout.addWidget(self.providers_scroll)
+        providers_group.setMaximumHeight(170)
+        layout.addWidget(providers_group)
 
         # Main Grid (classic)
         grid = QtWidgets.QGridLayout()
@@ -849,11 +1129,17 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
         model_btn_row = QtWidgets.QHBoxLayout()
         self.refresh_models_btn = QtWidgets.QPushButton("Refresh Models")
+        self.add_models_btn = QtWidgets.QPushButton("Add Provider Models")
         self.select_all_btn = QtWidgets.QPushButton("Select All")
-        self.clear_btn = QtWidgets.QPushButton("Clear")
+        self.clear_btn = QtWidgets.QPushButton("Uncheck All")
+        self.clear_model_list_btn = QtWidgets.QPushButton("Clear Model List")
+        self.add_models_btn.setToolTip("Append models from the currently selected provider.")
+        self.clear_model_list_btn.setToolTip("Remove all loaded models from all providers.")
         model_btn_row.addWidget(self.refresh_models_btn)
+        model_btn_row.addWidget(self.add_models_btn)
         model_btn_row.addWidget(self.select_all_btn)
         model_btn_row.addWidget(self.clear_btn)
+        model_btn_row.addWidget(self.clear_model_list_btn)
 
         left.addWidget(self.lb_title)
         left.addWidget(self.leader_list)
@@ -999,9 +1285,19 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
     def _connect_signals(self):
         self.connect_btn.clicked.connect(self._connect_base)
+        self.replace_models_btn.clicked.connect(self._replace_models_clicked)
+        self.provider_combo.currentIndexChanged.connect(self._provider_changed)
+        self.api_service_combo.currentIndexChanged.connect(self._api_service_changed)
+        self.api_key_inline.editingFinished.connect(self._api_key_changed)
+        self.show_key_check.toggled.connect(
+            lambda checked: self.api_key_inline.setEchoMode(QtWidgets.QLineEdit.Normal if checked else QtWidgets.QLineEdit.Password)
+        )
+        self.add_provider_btn.clicked.connect(self._add_current_provider_profile)
         self.refresh_models_btn.clicked.connect(self._refresh_models_clicked)
+        self.add_models_btn.clicked.connect(self._add_provider_models_clicked)
         self.select_all_btn.clicked.connect(self._select_all_models)
         self.clear_btn.clicked.connect(self._clear_models)
+        self.clear_model_list_btn.clicked.connect(self._clear_model_list)
         self.reset_btn.clicked.connect(self._reset_leaderboard_clicked)
         self.send_btn.clicked.connect(self._send)
         self.prompt_edit.returnPressed.connect(self._send)
@@ -1046,6 +1342,233 @@ class CouncilWindow(QtWidgets.QMainWindow):
         # Escape to stop current operation
         stop_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Escape"), self)
         stop_shortcut.activated.connect(self._stop_process)
+
+    def _provider_type_from_ui(self) -> str:
+        label = self.provider_combo.currentText().strip()
+        for provider_type, provider_name in PROVIDER_LABELS.items():
+            if provider_name == label:
+                return provider_type
+        return PROVIDER_LM_STUDIO
+
+    def _api_service_from_ui(self) -> str:
+        label = self.api_service_combo.currentText().strip()
+        for service, service_name in API_SERVICE_LABELS.items():
+            if service_name == label:
+                return service
+        return API_SERVICE_CUSTOM
+
+    def _current_provider_config(self) -> ProviderConfig:
+        self.api_key = self.api_key_inline.text().strip() if hasattr(self, "api_key_inline") else self.api_key
+        return make_provider_config(
+            provider_type=self.provider_type,
+            base_url=self.base_edit.text().strip(),
+            api_key=self.api_key,
+            model_path=self.model_path,
+            api_service=self.api_service,
+        )
+
+    def _provider_changed(self, _index: int):
+        self.api_key = self.api_key_inline.text().strip() if hasattr(self, "api_key_inline") else self.api_key
+        new_provider = self._provider_type_from_ui()
+        old_provider = getattr(self, "provider_type", PROVIDER_LM_STUDIO)
+        self.provider_type = new_provider
+        default_base, _ = provider_defaults(new_provider)
+        if not self.base_edit.text().strip():
+            self.base_edit.setText(default_base)
+        elif old_provider != new_provider:
+            old_default, _ = provider_defaults(old_provider)
+            if self.base_edit.text().strip() == old_default:
+                self.base_edit.setText(default_base)
+        if self.provider_type != PROVIDER_OPENAI_COMPAT:
+            self.api_service = API_SERVICE_CUSTOM
+            _, default_model_path = provider_defaults(self.provider_type)
+            self.model_path = default_model_path
+            self.api_service_combo.blockSignals(True)
+            self.api_service_combo.setCurrentText(api_service_label(self.api_service))
+            self.api_service_combo.blockSignals(False)
+        else:
+            if self.api_service == API_SERVICE_CUSTOM:
+                self.api_service = API_SERVICE_OPENAI
+                self.api_service_combo.blockSignals(True)
+                self.api_service_combo.setCurrentText(api_service_label(self.api_service))
+                self.api_service_combo.blockSignals(False)
+            self._apply_api_service_preset_if_needed(force=False)
+        self._update_provider_ui()
+        save_settings({
+            "provider_type": self.provider_type,
+            "base_url": self.base_edit.text().strip(),
+            "api_key": self.api_key,
+            "model_path": self.model_path,
+            "api_service": self.api_service,
+        })
+        self._set_status(f"Provider set to {provider_label(self.provider_type)}")
+
+    def _apply_api_service_preset_if_needed(self, force: bool):
+        if self.provider_type != PROVIDER_OPENAI_COMPAT:
+            return
+        service = normalize_api_service(self.api_service)
+        if service == API_SERVICE_CUSTOM:
+            return
+        preset = service_preset(service)
+        current_base = self.base_edit.text().strip()
+        current_model_path = (self.model_path or "").strip()
+        if force or not current_base:
+            self.base_edit.setText(preset["base_url"])
+        if force or not current_model_path:
+            self.model_path = preset["model_path"]
+
+    def _api_service_changed(self, _index: int):
+        self.api_key = self.api_key_inline.text().strip() if hasattr(self, "api_key_inline") else self.api_key
+        selected_service = self._api_service_from_ui()
+        self.api_service = selected_service
+        if selected_service != API_SERVICE_CUSTOM:
+            if self.provider_type != PROVIDER_OPENAI_COMPAT:
+                self.provider_combo.blockSignals(True)
+                self.provider_combo.setCurrentText(provider_label(PROVIDER_OPENAI_COMPAT))
+                self.provider_combo.blockSignals(False)
+                self.provider_type = PROVIDER_OPENAI_COMPAT
+            self._apply_api_service_preset_if_needed(force=True)
+        self._update_provider_ui()
+        save_settings({
+            "provider_type": self.provider_type,
+            "base_url": self.base_edit.text().strip(),
+            "api_key": self.api_key,
+            "model_path": self.model_path,
+            "api_service": self.api_service,
+        })
+
+    def _api_key_changed(self):
+        self.api_key = self.api_key_inline.text().strip()
+        save_settings({"api_key": self.api_key})
+
+    def _update_provider_ui(self):
+        hosted = self.provider_type == PROVIDER_OPENAI_COMPAT
+        custom_hosted = hosted and self.api_service == API_SERVICE_CUSTOM
+
+        self.api_service_label.setVisible(hosted)
+        self.api_service_combo.setVisible(hosted)
+        self.api_service_combo.setEnabled(hosted)
+
+        self.api_key_inline_label.setVisible(hosted)
+        self.api_key_inline.setVisible(hosted)
+        self.show_key_check.setVisible(hosted)
+
+        if hosted:
+            self.base_label.setText("API Base URL:")
+            self.base_edit.setEnabled(custom_hosted)
+            self.base_edit.setToolTip("Set custom endpoint only when API Service is Custom.")
+        else:
+            self.base_label.setText("Base URL:")
+            self.base_edit.setEnabled(True)
+            self.base_edit.setToolTip("")
+
+    def _current_profile_payload(self) -> Dict[str, str]:
+        provider = self._current_provider_config()
+        return {
+            "id": str(uuid.uuid4()),
+            "provider_type": provider.provider_type,
+            "api_service": provider.api_service,
+            "base_url": provider.base_url,
+            "api_key": provider.api_key,
+            "model_path": provider.model_path,
+        }
+
+    def _profile_summary(self, profile: Dict[str, str]) -> str:
+        provider_text = provider_label(profile.get("provider_type", PROVIDER_LM_STUDIO))
+        service = normalize_api_service(profile.get("api_service", API_SERVICE_CUSTOM))
+        if profile.get("provider_type") == PROVIDER_OPENAI_COMPAT and service != API_SERVICE_CUSTOM:
+            provider_text = f"{provider_text} / {api_service_label(service)}"
+        base = profile.get("base_url", "")
+        has_key = "key set" if profile.get("api_key", "") else "no key"
+        return f"{provider_text} - {base} ({has_key})"
+
+    def _save_provider_profiles(self):
+        save_settings({"provider_profiles": self.provider_profiles})
+
+    def _load_profile_into_controls(self, profile: Dict[str, str]):
+        self.provider_type = normalize_provider_type(profile.get("provider_type", PROVIDER_LM_STUDIO))
+        self.api_service = normalize_api_service(profile.get("api_service", API_SERVICE_CUSTOM))
+        self.model_path = profile.get("model_path", "")
+        self.api_key = profile.get("api_key", "")
+        self.provider_combo.blockSignals(True)
+        self.provider_combo.setCurrentText(provider_label(self.provider_type))
+        self.provider_combo.blockSignals(False)
+        self.api_service_combo.blockSignals(True)
+        self.api_service_combo.setCurrentText(api_service_label(self.api_service))
+        self.api_service_combo.blockSignals(False)
+        self.base_edit.setText(profile.get("base_url", ""))
+        self.api_key_inline.setText(self.api_key)
+        self._provider_changed(self.provider_combo.currentIndex())
+        self._api_service_changed(self.api_service_combo.currentIndex())
+
+    def _profile_use_clicked(self, profile_id: str):
+        for profile in self.provider_profiles:
+            if profile.get("id") == profile_id:
+                self._load_profile_into_controls(profile)
+                self._set_status("Provider loaded from saved list.")
+                return
+
+    def _profile_add_models_clicked(self, profile_id: str):
+        for profile in self.provider_profiles:
+            if profile.get("id") == profile_id:
+                self._load_profile_into_controls(profile)
+                self._add_provider_models_clicked()
+                return
+
+    def _profile_remove_clicked(self, profile_id: str):
+        self.provider_profiles = [p for p in self.provider_profiles if p.get("id") != profile_id]
+        if not self.provider_profiles:
+            self.provider_profiles = [self._current_profile_payload()]
+        self._save_provider_profiles()
+        self._render_provider_profiles()
+
+    def _add_current_provider_profile(self):
+        payload = self._current_profile_payload()
+        for existing in self.provider_profiles:
+            same = (
+                existing.get("provider_type") == payload["provider_type"]
+                and existing.get("api_service") == payload["api_service"]
+                and existing.get("base_url") == payload["base_url"]
+                and existing.get("model_path") == payload["model_path"]
+                and existing.get("api_key", "") == payload["api_key"]
+            )
+            if same:
+                self._set_status("Provider already saved.")
+                return
+        self.provider_profiles.append(payload)
+        self._save_provider_profiles()
+        self._render_provider_profiles()
+        self._set_status("Provider saved.")
+
+    def _render_provider_profiles(self):
+        if not hasattr(self, "providers_layout"):
+            return
+        while self.providers_layout.count():
+            item = self.providers_layout.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+            del item
+        self.provider_profile_rows.clear()
+        for profile in self.provider_profiles:
+            row = QtWidgets.QWidget()
+            row_layout = QtWidgets.QHBoxLayout(row)
+            row_layout.setContentsMargins(2, 2, 2, 2)
+            row_layout.setSpacing(6)
+            label = QtWidgets.QLabel(self._profile_summary(profile))
+            use_btn = QtWidgets.QPushButton("Use")
+            add_btn = QtWidgets.QPushButton("Add Models")
+            rm_btn = QtWidgets.QPushButton("Remove")
+            pid = profile.get("id", "")
+            use_btn.clicked.connect(lambda _=False, x=pid: self._profile_use_clicked(x))
+            add_btn.clicked.connect(lambda _=False, x=pid: self._profile_add_models_clicked(x))
+            rm_btn.clicked.connect(lambda _=False, x=pid: self._profile_remove_clicked(x))
+            row_layout.addWidget(label, 1)
+            row_layout.addWidget(use_btn)
+            row_layout.addWidget(add_btn)
+            row_layout.addWidget(rm_btn)
+            self.providers_layout.addWidget(row)
+            self.provider_profile_rows[pid] = row
+        self.providers_layout.addStretch(1)
 
     # ----- actions -----
     def _update_persona_combo_visibility(self):
@@ -1295,6 +1818,13 @@ class CouncilWindow(QtWidgets.QMainWindow):
         enable_personas_checkbox = QtWidgets.QCheckBox("Enable personas")
         enable_personas_checkbox.setChecked(self.use_roles)
         layout.addWidget(enable_personas_checkbox)
+
+        provider_hint = QtWidgets.QLabel(
+            "Provider configuration has moved to the main screen (top bar) to avoid conflicting settings."
+        )
+        provider_hint.setWordWrap(True)
+        provider_hint.setStyleSheet("color: #666;")
+        layout.addWidget(provider_hint)
 
         # Persona management section
         persona_group = QtWidgets.QGroupBox("Persona Management")
@@ -1554,100 +2084,174 @@ class CouncilWindow(QtWidgets.QMainWindow):
         save_settings({"single_voter_model": text})
 
     def _connect_base(self):
-        base = self.base_edit.text().strip() or "http://localhost:1234"
-        save_settings({"base_url": base})
-        self._set_status(f"Connecting to {base} …")
+        provider = self._current_provider_config()
+        if provider.provider_type == PROVIDER_OPENAI_COMPAT and not provider.api_key:
+            self._set_status("Add an API key before loading hosted provider models.")
+            return
+        save_settings({
+            "provider_type": provider.provider_type,
+            "base_url": provider.base_url,
+            "api_key": provider.api_key,
+            "model_path": provider.model_path,
+            "api_service": provider.api_service,
+        })
+        self._set_status(f"Loading models from {provider_label(provider.provider_type)} at {provider.base_url} …")
         self._busy(True)
-        QtCore.QTimer.singleShot(50, self._refresh_models)
+        QtCore.QTimer.singleShot(50, lambda: self._refresh_models(append=True))
+
+    def _replace_models_clicked(self):
+        provider = self._current_provider_config()
+        if provider.provider_type == PROVIDER_OPENAI_COMPAT and not provider.api_key:
+            self._set_status("Add an API key before loading hosted provider models.")
+            return
+        self._set_status("Replacing model list from selected provider …")
+        self._busy(True)
+        QtCore.QTimer.singleShot(50, lambda: self._refresh_models(append=False))
 
     def _refresh_models_clicked(self):
         self._set_status("Refreshing models …")
         self._busy(True)
-        QtCore.QTimer.singleShot(50, self._refresh_models)
+        QtCore.QTimer.singleShot(50, lambda: self._refresh_models(append=True))
 
-    def _refresh_models(self):
-        base = self.base_edit.text().strip() or "http://localhost:1234"
-        if self._model_thread and self._model_thread.isRunning():
+    def _add_provider_models_clicked(self):
+        provider = self._current_provider_config()
+        if provider.provider_type == PROVIDER_OPENAI_COMPAT and not provider.api_key:
+            self._set_status("Add an API key before loading hosted provider models.")
             return
+        self._set_status("Adding models from selected provider …")
+        self._busy(True)
+        QtCore.QTimer.singleShot(50, lambda: self._refresh_models(append=True))
 
-        self._model_worker = ModelFetchWorker(base)
-        self._model_thread = QtCore.QThread(self)
-        self._model_worker.moveToThread(self._model_thread)
+    def _refresh_models(self, append: bool = False):
+        try:
+            provider = self._current_provider_config()
+            if self._model_thread and self._model_thread.isRunning():
+                return
+            self._fetch_append = bool(append)
+            self._fetch_provider = provider
 
-        self._model_thread.started.connect(self._model_worker.run)
-        self._model_worker.finished.connect(self._models_fetched)
-        self._model_worker.failed.connect(self._models_fetch_failed)
+            self._model_worker = ModelFetchWorker(provider)
+            self._model_thread = QtCore.QThread(self)
+            self._model_worker.moveToThread(self._model_thread)
 
-        self._model_worker.finished.connect(self._model_thread.quit)
-        self._model_worker.failed.connect(self._model_thread.quit)
-        self._model_thread.finished.connect(self._model_thread.deleteLater)
-        self._model_worker.finished.connect(self._model_worker.deleteLater)
-        self._model_worker.failed.connect(self._model_worker.deleteLater)
+            self._model_thread.started.connect(self._model_worker.run)
+            self._model_worker.finished.connect(self._models_fetched)
+            self._model_worker.failed.connect(self._models_fetch_failed)
 
-        self._model_thread.start()
+            self._model_worker.finished.connect(self._model_thread.quit)
+            self._model_worker.failed.connect(self._model_thread.quit)
+            self._model_thread.finished.connect(self._model_thread.deleteLater)
+            self._model_worker.finished.connect(self._model_worker.deleteLater)
+            self._model_worker.failed.connect(self._model_worker.deleteLater)
+
+            self._model_thread.start()
+        except Exception as e:
+            self._busy(False)
+            self._set_status(f"Failed to start model refresh: {e}")
+
+    def _provider_tag(self, provider: ProviderConfig) -> str:
+        if provider.provider_type == PROVIDER_OPENAI_COMPAT and provider.api_service != API_SERVICE_CUSTOM:
+            return api_service_label(provider.api_service)
+        return provider_label(provider.provider_type)
+
+    def _make_display_model_name(self, provider: ProviderConfig, raw_model: str) -> str:
+        base_name = f"{self._provider_tag(provider)} :: {raw_model}"
+        if base_name not in self.model_actual_ids:
+            return base_name
+        i = 2
+        while True:
+            candidate = f"{base_name} ({i})"
+            if candidate not in self.model_actual_ids:
+                return candidate
+            i += 1
 
     def _models_fetched(self, models: List[str]):
-        self._model_thread = None
-        self._model_worker = None
-        self.models = models
+        try:
+            self._model_thread = None
+            self._model_worker = None
+            fetched_provider = self._fetch_provider or self._current_provider_config()
+            append_mode = bool(self._fetch_append)
+            self._fetch_provider = None
+            self._fetch_append = False
 
-        self._populate_models()
+            if not append_mode:
+                self.models = []
+                self.model_actual_ids.clear()
+                self.model_provider_map.clear()
 
-        self.single_voter_combo.blockSignals(True)
-        self.single_voter_combo.clear()
-        for m in self.models:
-            self.single_voter_combo.addItem(m)
-        last = load_settings().get("single_voter_model", "")
-        if last:
-            ix = self.single_voter_combo.findText(last)
-            if ix >= 0:
-                self.single_voter_combo.setCurrentIndex(ix)
-        self.single_voter_combo.blockSignals(False)
+            added = 0
+            for raw_model in models:
+                display_name = self._make_display_model_name(fetched_provider, raw_model)
+                if display_name in self.model_actual_ids:
+                    continue
+                self.models.append(display_name)
+                self.model_actual_ids[display_name] = raw_model
+                self.model_provider_map[display_name] = fetched_provider
+                added += 1
 
-        # Detect model capabilities
-        if ModelCapabilityDetector and models:
-            self._detect_model_capabilities()
+            self._populate_models()
 
-        self._busy(False)
-        if not self.models:
-            self._set_status("No models found. Check base URL or LM Studio.")
-        else:
-            self._set_status(f"Found {len(self.models)} models.")
+            self.single_voter_combo.blockSignals(True)
+            self.single_voter_combo.clear()
+            for m in self.models:
+                self.single_voter_combo.addItem(m)
+            last = load_settings().get("single_voter_model", "")
+            if last:
+                ix = self.single_voter_combo.findText(last)
+                if ix >= 0:
+                    self.single_voter_combo.setCurrentIndex(ix)
+            self.single_voter_combo.blockSignals(False)
+
+            if ModelCapabilityDetector and self.models:
+                self._detect_model_capabilities()
+
+            self._busy(False)
+            if not self.models:
+                self._set_status("No models found. Check provider settings and connection.")
+            else:
+                if append_mode:
+                    self._set_status(f"Added {added} models. Total available: {len(self.models)}.")
+                else:
+                    self._set_status(f"Found {len(self.models)} models.")
+        except Exception as e:
+            self._busy(False)
+            self._set_status(f"Failed to merge models: {e}")
     
     def _detect_model_capabilities(self):
         """Detect capabilities for loaded models."""
         if not ModelCapabilityDetector:
             return
-        
-        base = self.base_edit.text().strip() or "http://localhost:1234"
-        
+
         async def detect_all():
             async with aiohttp.ClientSession() as session:
-                # Check all models, not just first 3
+                model_data_cache: Dict[str, dict] = {}
                 for model in self.models:
+                    provider = self.model_provider_map.get(model, self._current_provider_config())
+                    raw_model = self.model_actual_ids.get(model, model)
                     try:
-                        # Quick check: if model name contains "vl" or "VL", it likely supports visual
                         model_lower = model.lower()
                         has_vl = "vl" in model_lower
-                        
-                        # Use API detection, but also check model name
-                        web_search = await ModelCapabilityDetector.detect_web_search(session, base, model)
-                        visual_api = await ModelCapabilityDetector.detect_visual(session, base, model)
-                        visual = visual_api or has_vl  # Combine API detection with name check
-                        
-                        self.model_capabilities[model] = {
-                            "web_search": web_search,
-                            "visual": visual
-                        }
+                        if provider.provider_type == PROVIDER_OLLAMA:
+                            self.model_capabilities[model] = {
+                                "web_search": False,
+                                "visual": any(k in raw_model.lower() for k in ["vision", "vl", "llava"]),
+                            }
+                        else:
+                            cache_key = f"{provider.provider_type}|{provider.base_url}|{provider.model_path}|{provider.api_key[:8]}"
+                            if cache_key not in model_data_cache:
+                                model_data_cache[cache_key] = await ModelCapabilityDetector.fetch_models_data(
+                                    session, provider.base_url, provider.api_key, provider.model_path
+                                )
+                            model_data = model_data_cache[cache_key]
+                            web_search = ModelCapabilityDetector.detect_web_search_from_data(model_data, raw_model)
+                            visual_api = ModelCapabilityDetector.detect_visual_from_data(model_data, raw_model)
+                            visual = visual_api or has_vl
+                            self.model_capabilities[model] = {"web_search": web_search, "visual": visual}
                     except Exception:
-                        # Fallback: check model name for "vl" pattern
                         model_lower = model.lower()
                         has_vl = "vl" in model_lower
-                        self.model_capabilities[model] = {
-                            "web_search": False,
-                            "visual": has_vl
-                        }
-        
+                        self.model_capabilities[model] = {"web_search": False, "visual": has_vl}
+
         # Run detection in background
         def worker():
             try:
@@ -1814,6 +2418,15 @@ class CouncilWindow(QtWidgets.QMainWindow):
     def _clear_models(self):
         for cb in self.model_checks.values():
             cb.setChecked(False)
+
+    def _clear_model_list(self):
+        self.models = []
+        self.model_actual_ids.clear()
+        self.model_provider_map.clear()
+        self.model_capabilities.clear()
+        self._populate_models()
+        self.single_voter_combo.clear()
+        self._set_status("Model list cleared.")
 
     def _reset_leaderboard_clicked(self):
         try:
@@ -2042,7 +2655,6 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self._set_status("Stopped.")
     
     def _send(self):
-        base = self.base_edit.text().strip() or "http://localhost:1234"
         selected = [m for m, cb in self.model_checks.items() if cb.isChecked()]
         if not selected:
             self._set_status("Select at least one model.")
@@ -2051,10 +2663,11 @@ class CouncilWindow(QtWidgets.QMainWindow):
         if not question:
             self._set_status("Ask something first.")
             return
+        self.last_submitted_question = question
 
         # Parse uploaded files for context and images
         context_block = ""
-        images_b64 = []
+        image_urls: List[str] = []
         
         if self.uploaded_files:
             context_parts = []
@@ -2064,9 +2677,10 @@ class CouncilWindow(QtWidgets.QMainWindow):
                 # Check for images
                 if suffix in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']:
                     try:
-                        with open(file_path, "rb") as img_file:
-                            b64_data = base64.b64encode(img_file.read()).decode('utf-8')
-                            images_b64.append(b64_data)
+                        if ModelCapabilityDetector:
+                            encoded_image = ModelCapabilityDetector.encode_image(file_path)
+                            if encoded_image:
+                                image_urls.append(encoded_image)
                     except Exception as e:
                         self._set_status(f"Error processing image {file_path.name}: {e}")
                     continue
@@ -2097,12 +2711,19 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
         # Handle mode selection
         if self.mode == "discussion":
-            self._send_discussion_mode(base, selected, question, context_block, images_b64)
+            self._send_discussion_mode(selected, question, context_block, image_urls)
         else:
-            self._send_deliberation_mode(base, selected, question, context_block, images_b64)
+            self._send_deliberation_mode(selected, question, context_block, image_urls)
     
-    def _send_deliberation_mode(self, base: str, selected: List[str], question: str, context_block: str, images: List[str] = []):
+    def _send_deliberation_mode(
+        self,
+        selected: List[str],
+        question: str,
+        context_block: str,
+        images: Optional[List[str]] = None,
+    ):
         """Send in Deliberation Mode (existing functionality)."""
+        images = images or []
         # Use self.use_roles instead of removed roles_check
         if self.use_roles:
             roles_map = {}
@@ -2143,6 +2764,13 @@ class CouncilWindow(QtWidgets.QMainWindow):
         
         # Web search status
         web_search = self.web_search_check.isChecked()
+        model_entries = []
+        for model_id in selected:
+            model_entries.append({
+                "id": model_id,
+                "model": self.model_actual_ids.get(model_id, model_id),
+                "provider": self.model_provider_map.get(model_id, self._current_provider_config()),
+            })
 
         def worker():
             try:
@@ -2156,7 +2784,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
                         self.status_signal.emit(f"⚠ Single voter '{short_id(single_voter_model)}' not available, using all models as voters")
                 answers, winner, details, tally = asyncio.run(
                     council_round(
-                        base, selected, question, roles_map, self.status_signal.emit,
+                        model_entries, question, roles_map, self.status_signal.emit,
                         max_concurrency=conc, voter_override=voters,
                         images=images, web_search=web_search, temperature=temp,
                         is_cancelled=lambda: self._stop_requested
@@ -2177,48 +2805,72 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self._current_worker_thread.start()
         self._busy(True)
     
-    def _send_discussion_mode(self, base: str, selected: List[str], question: str, context_block: str):
+    def _send_discussion_mode(
+        self,
+        selected: List[str],
+        question: str,
+        context_block: str,
+        images: Optional[List[str]] = None,
+    ):
         """Send in Collaborative Discussion Mode."""
         if DiscussionManager is None:
             QtWidgets.QMessageBox.warning(self, "Discussion Mode Unavailable", 
                 "Discussion mode requires core modules. Please check installation.")
             return
+        images = images or []
         
         # Build agent configurations
         agents = []
         for model in selected:
             persona_name = self.persona_assignments.get(model, "None")
             persona_config = self._build_persona_config(model, persona_name)
+            provider = self.model_provider_map.get(model, self._current_provider_config())
             
             agent = {
                 "name": f"Agent {model[:20]}",
-                "model": model,
+                "model": self.model_actual_ids.get(model, model),
                 "is_active": True,
                 "persona_config": persona_config,
-                "persona_name": persona_name if persona_name != "None" else None
+                "persona_name": persona_name if persona_name != "None" else None,
+                "provider_type": provider.provider_type,
+                "base_url": provider.base_url,
+                "api_key": provider.api_key,
+                "model_path": provider.model_path,
             }
             agents.append(agent)
         
         # Prepare UI for discussion mode
         self._prepare_discussion_tabs(selected)
         self._append_chat(f"You: {question}")
+        if images:
+            self._append_chat(f"<i>[Attached {len(images)} image(s)]</i>")
         self.prompt_edit.clear()
         self._set_status("Starting collaborative discussion…")
 
         conc = int(self.conc_spin.value())
+        temp = self.temp_slider.value() / 100.0
+        web_search = self.web_search_check.isChecked()
 
         def worker():
             try:
                 self._stop_requested = False
+                base_provider = self.model_provider_map.get(selected[0], self._current_provider_config())
                 manager = DiscussionManager(
-                    base_url=base,
+                    provider_type=base_provider.provider_type,
+                    base_url=base_provider.base_url,
+                    api_key=base_provider.api_key,
+                    model_path=base_provider.model_path,
                     agents=agents,
                     user_prompt=question,
                     context_block=context_block,
+                    images=images,
+                    web_search_enabled=web_search,
+                    temperature=temp,
                     status_callback=self.status_signal.emit,
                     update_callback=lambda entry: self.discussion_update_signal.emit(entry),
                     max_turns=10,
-                    max_concurrency=conc
+                    max_concurrency=conc,
+                    is_cancelled=lambda: self._stop_requested
                 )
                 transcript, synthesis = asyncio.run(manager.run_discussion())
                 if not self._stop_requested:
@@ -2387,7 +3039,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.write("# PolyCouncil Discussion Report\n\n")
                 f.write(f"**Date:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"**Question:** {self.prompt_edit.text() if hasattr(self, 'prompt_edit') and self.prompt_edit.text() else 'N/A'}\n\n")
+                exported_question = self.last_submitted_question if self.last_submitted_question else "N/A"
+                f.write(f"**Question:** {exported_question}\n\n")
                 
                 f.write("## Transcript\n\n")
                 for entry in self.discussion_transcript:
@@ -2555,12 +3208,32 @@ Question: {question}
         
         self._set_status("Discussion complete.")
 
+    def closeEvent(self, event: QtGui.QCloseEvent):
+        try:
+            provider = self._current_provider_config()
+            save_settings({
+                "provider_type": provider.provider_type,
+                "base_url": provider.base_url,
+                "api_key": provider.api_key,
+                "model_path": provider.model_path,
+                "api_service": provider.api_service,
+                "provider_profiles": self.provider_profiles,
+                "single_voter_enabled": self.single_voter_check.isChecked(),
+                "single_voter_model": self.single_voter_combo.currentText().strip(),
+                "max_concurrency": int(self.conc_spin.value()),
+                "roles_enabled": bool(self.use_roles),
+            })
+        except Exception:
+            pass
+        super().closeEvent(event)
+
 # -----------------------
 # Entry point
 # -----------------------
 def main():
     import sys
     import platform
+    sys.excepthook = log_unhandled_exception
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("PolyCouncil")
     app.setApplicationDisplayName("PolyCouncil")

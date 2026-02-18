@@ -2,7 +2,7 @@
 
 <div align="center">
 
-**A multi-model deliberation engine for LM Studio**
+**A multi-model deliberation engine for local and hosted providers**
 
 *Running a single model gives you one perspective. Running a council gives you… perspective squared.*
 
@@ -47,6 +47,10 @@ This creates a more reliable, research-friendly way to:
 - **Rubric-Based Scoring**: Each model evaluates every other response across customizable criteria (accuracy, clarity, completeness, etc.)
 - **Consensus Voting System**: Final answer chosen through weighted voting based on rubric scores
 - **Leaderboard Tracking**: Track which models perform best over time with persistent statistics
+- **Multi-Provider Support**:
+  - LM Studio (default, OpenAI-compatible)
+  - OpenAI-compatible APIs (custom base URL + API key)
+  - Ollama (local runtime)
 
 ### Persona System
 
@@ -69,7 +73,7 @@ This creates a more reliable, research-friendly way to:
 
 ### User Interface
 
-- **Centralized Settings**: Easy-to-use settings dialog for configuration
+- **Provider Profiles**: Save multiple providers and load/add models from each without retyping settings
 - **Debug Log Dock**: Dockable panel for detailed analysis of the deliberation process
 - **Modern UI**: Clean, intuitive interface built with PySide6 with automatic dark/light theme support
 - **Persistent Settings**: All preferences saved automatically
@@ -127,11 +131,15 @@ python council.py
 
 ### First Time Setup
 
-1. **Launch LM Studio** and ensure at least one model is loaded
+1. **Launch at least one model provider** (LM Studio, Ollama, or hosted API)
 2. **Start PolyCouncil** (either EXE or `python council.py`)
-3. **Configure Base URL** (default: `http://localhost:1234`) if LM Studio uses a different port
-4. **Click "Connect"** to discover available models
-5. **Select models** by checking the boxes next to model names
+3. **Choose Provider** in the top bar:
+   - Local: `LM Studio` (`http://localhost:1234`) or `Ollama` (`http://localhost:11434`)
+   - Hosted: `OpenAI-compatible API` + API service preset (`OpenAI`, `OpenRouter`, `Google Gemini`) + API key
+4. Click **Add Models** to append that provider's models
+5. Repeat step 3-4 for any additional providers
+6. Use **Add Provider** to save reusable provider configurations
+7. Select models (including mixed providers) and run the council
 
 ### Using Personas
 
@@ -203,13 +211,16 @@ Test how different personas affect model responses. Useful for understanding bia
 
 ![PolyCouncil Result](Polycouncil2.png)
 
+![Saved Providers Workflow](docs/saved-providers.png)
+
 ---
 
 ## Configuration
 
 PolyCouncil automatically saves your preferences, including:
-- LM Studio base URL
-- Selected models
+- Active provider selection and API service
+- API endpoint settings and keys
+- Saved provider profiles
 - Persona assignments
 - Concurrency settings
 - Debug mode preference
@@ -222,10 +233,10 @@ Settings are stored in `council_settings.json` in the application directory.
 ## Troubleshooting
 
 ### Models Not Appearing
-- Ensure LM Studio is running
-- Verify at least one model is loaded in LM Studio
-- Check that the base URL is correct (default: `http://localhost:1234`)
-- Click "Refresh Models" if needed
+- Verify the selected provider and endpoint are correct
+- For hosted APIs, confirm a valid API key is set
+- For LM Studio/Ollama, ensure the local server is running and models are loaded
+- Use **Add Models** to append, or **Replace List** to rebuild from one provider
 
 ### Slow Performance
 - Reduce "Max concurrent jobs" to 1-2

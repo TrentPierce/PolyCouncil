@@ -10,6 +10,10 @@ from typing import Dict, List, Optional, Tuple, Callable
 from pathlib import Path
 import aiohttp
 
+PROVIDER_LM_STUDIO = "lm_studio"
+PROVIDER_OPENAI_COMPAT = "openai_compatible"
+PROVIDER_OLLAMA = "ollama"
+
 # Core system instruction for Collaborative Discussion Mode
 CORE_SYSTEM_INSTRUCTION = """You are participating in a Collaborative Discussion to fully examine the user's request. Speak in character based on your assigned persona. Your message must be brief, constructive, and move the discussion forward. The discussion is ongoing until a comprehensive, multi-sided consensus or ruling is reached."""
 
@@ -19,11 +23,14 @@ class DiscussionManager:
     
     def __init__(
         self,
+        provider_type: str,
         base_url: str,
+        api_key: str,
+        model_path: str,
         agents: List[Dict],
         user_prompt: str,
         context_block: str = "",
-        images: List[str] = [],  # List of base64 image strings
+        images: Optional[List[str]] = None,  # List of data URL image strings
         web_search_enabled: bool = False,
         temperature: float = 0.7,
         status_callback: Optional[Callable[[str], None]] = None,
@@ -36,11 +43,14 @@ class DiscussionManager:
         Initialize the discussion manager.
         
         Args:
-            base_url: LM Studio base URL
+            provider_type: Provider type (`lm_studio`, `openai_compatible`, or `ollama`)
+            base_url: Provider base URL
+            api_key: Provider API key (when required)
+            model_path: OpenAI-compatible model listing path
             agents: List of agent configurations with persona_config
             user_prompt: The user's main question/prompt
             context_block: Pre-formatted context from file parsing (if any)
-            images: List of base64 encoded image strings
+            images: List of image data URLs
             web_search_enabled: Whether to enable web search tools
             temperature: Model temperature
             status_callback: Optional callback for status updates
@@ -48,11 +58,14 @@ class DiscussionManager:
             max_concurrency: Maximum concurrent model calls
             is_cancelled: Callable to check for cancellation
         """
+        self.provider_type = provider_type or PROVIDER_LM_STUDIO
         self.base_url = base_url
+        self.api_key = api_key or ""
+        self.model_path = model_path or "v1/models"
         self.agents = agents
         self.user_prompt = user_prompt
         self.context_block = context_block
-        self.images = images
+        self.images = images or []
         self.web_search_enabled = web_search_enabled
         self.temperature = temperature
         self.status_callback = status_callback
@@ -66,6 +79,43 @@ class DiscussionManager:
         self.consensus_reached = False
         self.conversation_summary: str = ""  # Rolling summary of older conversation
         self.summarized_context: str = ""  # Summarized file context
+
+    def _agent_provider(self, agent: Optional[Dict] = None) -> Tuple[str, str, str, str]:
+        if agent:
+            return (
+                agent.get("provider_type", self.provider_type),
+                agent.get("base_url", self.base_url),
+                agent.get("api_key", self.api_key),
+                agent.get("model_path", self.model_path),
+            )
+        return (self.provider_type, self.base_url, self.api_key, self.model_path)
+
+    def _headers(self, agent: Optional[Dict] = None) -> Dict[str, str]:
+        provider_type, base_url, api_key, _ = self._agent_provider(agent)
+        headers = {"Content-Type": "application/json"}
+        if provider_type == PROVIDER_OPENAI_COMPAT and api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        if provider_type == PROVIDER_OPENAI_COMPAT and "openrouter.ai" in base_url.lower():
+            headers.setdefault("HTTP-Referer", "https://github.com/TrentPierce/PolyCouncil")
+            headers.setdefault("X-Title", "PolyCouncil")
+        return headers
+
+    def _chat_url(self, agent: Optional[Dict] = None) -> str:
+        provider_type, base_url, _, _ = self._agent_provider(agent)
+        base = base_url.rstrip("/")
+        if provider_type == PROVIDER_OLLAMA:
+            return f"{base}/api/chat"
+        lower = base.lower()
+        has_versioned_base = (
+            lower.endswith("/v1")
+            or lower.endswith("/v1beta")
+            or lower.endswith("/v1beta/openai")
+            or lower.endswith("/openai")
+            or lower.endswith("/api/v1")
+        )
+        if has_versioned_base:
+            return f"{base}/chat/completions"
+        return f"{base}/v1/chat/completions"
     
     def _get_persona_prompt(self, agent: Dict) -> str:
         """
@@ -275,51 +325,54 @@ class DiscussionManager:
         prompt = self._assemble_prompt(agent, conversation_history)
         
         try:
-            url = f"{self.base_url.rstrip('/')}/v1/chat/completions"
-            
-            # Construct message content (multimodal if images exist)
-            if self.images:
-                content_list = [{"type": "text", "text": prompt}]
-                for img_b64 in self.images:
-                    content_list.append({
-                        "type": "image_url", 
-                        "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}
-                    })
-                messages = [{"role": "user", "content": content_list}]
-            else:
-                messages = [{"role": "user", "content": prompt}]
-            
-            payload = {
-                "model": model,
-                "messages": messages,
-                "temperature": self.temperature,
-            }
-            
-            # Inject Web Search Tools if enabled
-            if self.web_search_enabled:
-                payload["tools"] = [{
-                    "type": "function",
-                    "function": {
-                        "name": "google_search",
-                        "description": "Search the web for current information.",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "query": {"type": "string", "description": "The search query"}
-                            },
-                            "required": ["query"]
-                        }
-                    }
-                }]
-            
+            provider_type, _, _, _ = self._agent_provider(agent)
+            url = self._chat_url(agent)
+            headers = self._headers(agent)
             timeout = aiohttp.ClientTimeout(total=120)
-            async with session.post(url, json=payload, timeout=timeout) as resp:
+            if provider_type == PROVIDER_OLLAMA:
+                payload = {
+                    "model": model,
+                    "stream": False,
+                    "options": {"temperature": self.temperature},
+                    "messages": [{"role": "user", "content": prompt}],
+                }
+            else:
+                if self.images:
+                    content_list = [{"type": "text", "text": prompt}]
+                    for image_url in self.images:
+                        content_list.append({"type": "image_url", "image_url": {"url": image_url}})
+                    messages = [{"role": "user", "content": content_list}]
+                else:
+                    messages = [{"role": "user", "content": prompt}]
+                payload = {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": self.temperature,
+                }
+                if self.web_search_enabled:
+                    payload["tools"] = [{
+                        "type": "function",
+                        "function": {
+                            "name": "google_search",
+                            "description": "Search the web for current information.",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"query": {"type": "string", "description": "The search query"}},
+                                "required": ["query"],
+                            },
+                        },
+                    }]
+
+            async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
                 if resp.status != 200:
                     text = await resp.text()
                     raise RuntimeError(f"HTTP {resp.status}: {text[:800]}")
                 
                 data = await resp.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                if provider_type == PROVIDER_OLLAMA:
+                    content = data.get("message", {}).get("content", "")
+                else:
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 return content
                 
         except Exception as e:
@@ -468,21 +521,34 @@ Summary:"""
             if not model:
                 return ""
             
-            url = f"{self.base_url.rstrip('/')}/v1/chat/completions"
-            payload = {
-                "model": model,
-                "messages": [{"role": "user", "content": summary_prompt}],
-                "temperature": 0.3,
-                "max_tokens": 200,  # Keep summary short
-            }
+            provider_type, _, _, _ = self._agent_provider(summary_agent)
+            url = self._chat_url(summary_agent)
+            headers = self._headers(summary_agent)
+            if provider_type == PROVIDER_OLLAMA:
+                payload = {
+                    "model": model,
+                    "stream": False,
+                    "options": {"temperature": 0.3},
+                    "messages": [{"role": "user", "content": summary_prompt}],
+                }
+            else:
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": summary_prompt}],
+                    "temperature": 0.3,
+                    "max_tokens": 200,
+                }
             
             timeout = aiohttp.ClientTimeout(total=60)
-            async with session.post(url, json=payload, timeout=timeout) as resp:
+            async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
                 if resp.status != 200:
                     return ""
                 
                 data = await resp.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                if provider_type == PROVIDER_OLLAMA:
+                    content = data.get("message", {}).get("content", "")
+                else:
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 return content.strip()
                 
         except Exception as e:
@@ -516,6 +582,10 @@ Summary:"""
             
             for turn in range(self.max_turns):
                 self.turn_count = turn + 1
+                if self.is_cancelled and self.is_cancelled():
+                    if self.status_callback:
+                        self.status_callback("Discussion cancelled by user.")
+                    break
                 
                 if self.status_callback:
                     self.status_callback(f"Discussion turn {self.turn_count}/{self.max_turns}...")
@@ -535,6 +605,10 @@ Summary:"""
                 
                 tasks = [call_with_semaphore(agent) for agent in active_agents]
                 responses = await asyncio.gather(*tasks)
+                if self.is_cancelled and self.is_cancelled():
+                    if self.status_callback:
+                        self.status_callback("Discussion cancelled by user.")
+                    break
                 
                 # Record responses in transcript and emit updates
                 for agent, response in zip(active_agents, responses):
@@ -581,7 +655,9 @@ Summary:"""
                 await asyncio.sleep(0.5)
             
             # Generate final synthesis
-            final_synthesis = await self._generate_synthesis(session, conversation_history)
+            final_synthesis = None
+            if not (self.is_cancelled and self.is_cancelled()):
+                final_synthesis = await self._generate_synthesis(session, conversation_history)
             
             if self.status_callback:
                 self.status_callback("Discussion complete.")
@@ -682,15 +758,25 @@ Discussion:
 
 Synthesis:"""
             
-            url = f"{self.base_url.rstrip('/')}/v1/chat/completions"
-            payload = {
-                "model": model,
-                "messages": [{"role": "user", "content": synthesis_prompt}],
-                "temperature": 0.5,
-            }
+            provider_type, _, _, _ = self._agent_provider(synthesis_agent)
+            url = self._chat_url(synthesis_agent)
+            headers = self._headers(synthesis_agent)
+            if provider_type == PROVIDER_OLLAMA:
+                payload = {
+                    "model": model,
+                    "stream": False,
+                    "options": {"temperature": 0.5},
+                    "messages": [{"role": "user", "content": synthesis_prompt}],
+                }
+            else:
+                payload = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": synthesis_prompt}],
+                    "temperature": 0.5,
+                }
             
             timeout = aiohttp.ClientTimeout(total=180)  # Longer timeout for synthesis
-            async with session.post(url, json=payload, timeout=timeout) as resp:
+            async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
                     if self.status_callback:
@@ -702,7 +788,9 @@ Synthesis:"""
                 
                 # Extract content - handle different response formats
                 content = None
-                if "choices" in data and len(data["choices"]) > 0:
+                if provider_type == PROVIDER_OLLAMA:
+                    content = data.get("message", {}).get("content", "")
+                elif "choices" in data and len(data["choices"]) > 0:
                     choice = data["choices"][0]
                     if "message" in choice:
                         content = choice["message"].get("content", "")
@@ -736,4 +824,3 @@ Synthesis:"""
             import traceback
             traceback.print_exc()
             return None
-

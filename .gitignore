@@ -21,6 +21,7 @@ token.json
 logs/
 *.log
 *.log.*
+polycouncil_crash.log
 
 # Models / weights / large artifacts
 models/
@@ -52,6 +53,8 @@ temp/
 *.tmp
 *.swp
 *.swo
+.pytest_cache/
+pytest-cache-files-*
 
 # Editors / workspace
 *.code-workspace
@@ -83,6 +86,7 @@ test_*.py
 # Icons and resources (keep only essential)
 *.ico
 *.png
+!docs/*.png
 *.rc
 PolyCouncil.rc
 
