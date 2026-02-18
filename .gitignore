@@ -51,6 +51,9 @@ coverage/          # if you use JS coverage; Python coverage already handled
 tmp/
 temp/
 *.tmp
+.tmp-*/
+.release-artifacts/
+dist_profiles/
 *.swp
 *.swo
 .pytest_cache/
