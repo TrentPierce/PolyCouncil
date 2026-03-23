@@ -22,6 +22,12 @@ def test_make_provider_config_defaults_and_normalization():
     assert cfg2.base_url == "http://localhost:1234"
     assert cfg2.model_path == "v1/models"
 
+    cfg3 = make_provider_config(PROVIDER_LM_STUDIO, "http://example.com:1234/v1", "", "")
+    assert cfg3.base_url == "http://example.com:1234"
+
+    cfg4 = make_provider_config(PROVIDER_OPENAI_COMPAT, "https://api.example.com/v1/models", "k", "v1/models")
+    assert cfg4.base_url == "https://api.example.com"
+
 
 def test_parse_models_response_openai_compatible():
     provider = make_provider_config(PROVIDER_OPENAI_COMPAT, "http://example.com", "k", "v1/models")

@@ -222,6 +222,10 @@ class ProviderConfig:
     model_path: str = ""
     api_service: str = API_SERVICE_CUSTOM
 
+
+class ModelFetchError(RuntimeError):
+    pass
+
 def _profile_secret_name(profile_id: str) -> str:
     return f"provider-profile::{profile_id}"
 
@@ -440,6 +444,28 @@ def provider_defaults(provider_type: str) -> tuple[str, str]:
     return "http://localhost:1234", "v1/models"
 
 
+def canonicalize_base_url(provider_type: str, base_url: str) -> str:
+    normalized_type = normalize_provider_type(provider_type)
+    cleaned = (base_url or "").strip().rstrip("/")
+    if not cleaned:
+        return cleaned
+
+    suffixes = []
+    if normalized_type == PROVIDER_LM_STUDIO:
+        suffixes = ["/v1/models", "/v1/chat/completions", "/v1"]
+    elif normalized_type == PROVIDER_OLLAMA:
+        suffixes = ["/api/tags", "/api/chat", "/api"]
+    else:
+        suffixes = ["/v1/models", "/models", "/v1/chat/completions", "/chat/completions"]
+
+    lower_cleaned = cleaned.lower()
+    for suffix in suffixes:
+        if lower_cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)]
+            break
+    return cleaned.rstrip("/")
+
+
 def make_provider_config(
     provider_type: str,
     base_url: str,
@@ -451,7 +477,7 @@ def make_provider_config(
     normalized_type = normalize_provider_type(provider_type)
     normalized_service = normalize_api_service(api_service)
     preset = service_preset(normalized_service) if normalized_type == PROVIDER_OPENAI_COMPAT else {"base_url": "", "model_path": ""}
-    normalized_base = (base_url or default_base).strip()
+    normalized_base = canonicalize_base_url(normalized_type, base_url or default_base)
     if normalized_type == PROVIDER_OPENAI_COMPAT and normalized_service != API_SERVICE_CUSTOM and not base_url.strip():
         normalized_base = preset["base_url"]
     normalized_path = (model_path or default_model_path).strip().lstrip("/")
@@ -516,12 +542,22 @@ def endpoints(provider: ProviderConfig):
 def parse_models_response(provider: ProviderConfig, data: dict) -> List[str]:
     ids: List[str] = []
     if provider.provider_type == PROVIDER_OLLAMA:
-        for item in data.get("models", []):
+        models = data.get("models", [])
+        if not isinstance(models, list):
+            return []
+        for item in models:
+            if not isinstance(item, dict):
+                continue
             name = item.get("name")
             if name:
                 ids.append(str(name))
         return sorted(set(ids))
-    for item in data.get("data", []):
+    model_entries = data.get("data", [])
+    if not isinstance(model_entries, list):
+        return []
+    for item in model_entries:
+        if not isinstance(item, dict):
+            continue
         mid = item.get("id") or item.get("name")
         if mid:
             ids.append(str(mid))
@@ -530,13 +566,21 @@ def parse_models_response(provider: ProviderConfig, data: dict) -> List[str]:
 
 def fetch_models(provider: ProviderConfig) -> List[str]:
     try:
-        r = requests.get(endpoints(provider)["models"], headers=request_headers(provider), timeout=10)
+        model_url = endpoints(provider)["models"]
+        r = requests.get(model_url, headers=request_headers(provider), timeout=(5, 20))
         r.raise_for_status()
-        data = r.json()
-        return parse_models_response(provider, data)
+        try:
+            data = r.json()
+        except requests.JSONDecodeError as exc:
+            raise ModelFetchError(f"Endpoint returned non-JSON from {model_url}") from exc
+        models = parse_models_response(provider, data)
+        if models:
+            return models
+        raise ModelFetchError(f"No models found at {model_url}. Check whether the base URL already includes a path like /v1 or /v1/models.")
     except Exception as e:
-        print(f"fetch_models error [{provider.provider_type}]:", e)
-        return []
+        if isinstance(e, ModelFetchError):
+            raise
+        raise ModelFetchError(f"{provider_label(provider.provider_type)} request failed: {e}") from e
 
 # -----------------------
 # Concurrency helper
@@ -1108,11 +1152,11 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.conc_spin.setValue(max(1, min(saved_conc, self.conc_spin.maximum())))
         self.conc_spin.blockSignals(False)
 
-        # initial connect
-        QtCore.QTimer.singleShot(50, self._connect_base)
         self._refresh_leaderboard()
         if not self.secure_keyring_available:
             self._set_status("Secure keychain unavailable. Hosted API keys will only persist for the current session.")
+        else:
+            self._set_status("Ready. Choose a provider, then load models.")
 
     # ----- UI -----
     def _build_ui(self):
@@ -1173,10 +1217,10 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.api_key_inline.setPlaceholderText("Paste API key")
         self.api_key_inline.setMinimumWidth(220)
         self.show_key_check = QtWidgets.QCheckBox("Show")
-        self.connect_btn = QtWidgets.QPushButton("Add Models")
-        self.replace_models_btn = QtWidgets.QPushButton("Replace List")
-        self.connect_btn.setToolTip("Append models from selected provider to the existing list.")
-        self.replace_models_btn.setToolTip("Replace the current model list with models from selected provider.")
+        self.connect_btn = QtWidgets.QPushButton("Load Selected")
+        self.replace_models_btn = QtWidgets.QPushButton("Replace Loaded")
+        self.connect_btn.setToolTip("Load models from the provider currently shown in the top bar and append them to the loaded list.")
+        self.replace_models_btn.setToolTip("Clear the currently loaded models and replace them with the selected provider's models.")
 
         # Single voter controls
         self.single_voter_check = QtWidgets.QCheckBox("Single-voter")
@@ -1218,16 +1262,20 @@ class CouncilWindow(QtWidgets.QMainWindow):
         layout.addLayout(top)
 
         # Saved providers section
-        providers_group = QtWidgets.QGroupBox("Saved Providers")
+        providers_group = QtWidgets.QGroupBox("Saved Provider Profiles")
         providers_group_layout = QtWidgets.QVBoxLayout(providers_group)
         providers_group_layout.setContentsMargins(8, 8, 8, 8)
         providers_group_layout.setSpacing(6)
 
         providers_header = QtWidgets.QHBoxLayout()
-        self.add_provider_btn = QtWidgets.QPushButton("Add Provider")
+        self.add_provider_btn = QtWidgets.QPushButton("Save Current")
         providers_header.addWidget(self.add_provider_btn)
         providers_header.addStretch(1)
         providers_group_layout.addLayout(providers_header)
+        providers_help = QtWidgets.QLabel("Save reusable endpoints here. Use = load its settings. Load = fetch models from that saved provider.")
+        providers_help.setWordWrap(True)
+        providers_help.setStyleSheet("color: #666;")
+        providers_group_layout.addWidget(providers_help)
 
         self.providers_scroll = QtWidgets.QScrollArea()
         self.providers_scroll.setWidgetResizable(True)
@@ -1273,15 +1321,13 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.models_area.setWidget(self.models_inner)
 
         model_btn_row = QtWidgets.QHBoxLayout()
-        self.refresh_models_btn = QtWidgets.QPushButton("Refresh Models")
-        self.add_models_btn = QtWidgets.QPushButton("Add Provider Models")
+        self.refresh_models_btn = QtWidgets.QPushButton("Reload Selected Provider")
         self.select_all_btn = QtWidgets.QPushButton("Select All")
         self.clear_btn = QtWidgets.QPushButton("Uncheck All")
         self.clear_model_list_btn = QtWidgets.QPushButton("Clear Model List")
-        self.add_models_btn.setToolTip("Append models from the currently selected provider.")
+        self.refresh_models_btn.setToolTip("Reload models from the provider currently shown in the top bar.")
         self.clear_model_list_btn.setToolTip("Remove all loaded models from all providers.")
         model_btn_row.addWidget(self.refresh_models_btn)
-        model_btn_row.addWidget(self.add_models_btn)
         model_btn_row.addWidget(self.select_all_btn)
         model_btn_row.addWidget(self.clear_btn)
         model_btn_row.addWidget(self.clear_model_list_btn)
@@ -1446,7 +1492,6 @@ class CouncilWindow(QtWidgets.QMainWindow):
         )
         self.add_provider_btn.clicked.connect(self._add_current_provider_profile)
         self.refresh_models_btn.clicked.connect(self._refresh_models_clicked)
-        self.add_models_btn.clicked.connect(self._add_provider_models_clicked)
         self.select_all_btn.clicked.connect(self._select_all_models)
         self.clear_btn.clicked.connect(self._clear_models)
         self.clear_model_list_btn.clicked.connect(self._clear_model_list)
@@ -1712,7 +1757,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
             row_layout.setSpacing(6)
             label = QtWidgets.QLabel(self._profile_summary(profile))
             use_btn = QtWidgets.QPushButton("Use")
-            add_btn = QtWidgets.QPushButton("Add Models")
+            add_btn = QtWidgets.QPushButton("Load")
             rm_btn = QtWidgets.QPushButton("Remove")
             pid = profile.get("id", "")
             use_btn.clicked.connect(lambda _=False, x=pid: self._profile_use_clicked(x))
@@ -2313,7 +2358,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
         })
         self._set_status(f"Loading models from {provider_label(provider.provider_type)} at {provider.base_url} …")
         self._busy(True)
-        QtCore.QTimer.singleShot(50, lambda: self._refresh_models(append=True))
+        self._refresh_models(append=True)
 
     def _replace_models_clicked(self):
         provider = self._current_provider_config()
@@ -2322,26 +2367,27 @@ class CouncilWindow(QtWidgets.QMainWindow):
             return
         self._set_status("Replacing model list from selected provider …")
         self._busy(True)
-        QtCore.QTimer.singleShot(50, lambda: self._refresh_models(append=False))
+        self._refresh_models(append=False)
 
     def _refresh_models_clicked(self):
-        self._set_status("Refreshing models …")
+        self._set_status("Reloading models from the selected provider …")
         self._busy(True)
-        QtCore.QTimer.singleShot(50, lambda: self._refresh_models(append=True))
+        self._refresh_models(append=True)
 
     def _add_provider_models_clicked(self):
         provider = self._current_provider_config()
         if provider.provider_type == PROVIDER_OPENAI_COMPAT and not provider.api_key:
             self._set_status("Add an API key before loading hosted provider models.")
             return
-        self._set_status("Adding models from selected provider …")
+        self._set_status("Loading models from saved provider …")
         self._busy(True)
-        QtCore.QTimer.singleShot(50, lambda: self._refresh_models(append=True))
+        self._refresh_models(append=True)
 
     def _refresh_models(self, append: bool = False):
         try:
             provider = self._current_provider_config()
             if self._model_thread and self._model_thread.isRunning():
+                self._set_status("A model load is already in progress. Wait for it to finish or stop it first.")
                 return
             self._fetch_append = bool(append)
             self._fetch_provider = provider
@@ -2472,9 +2518,6 @@ class CouncilWindow(QtWidgets.QMainWindow):
         def worker():
             try:
                 asyncio.run(detect_all())
-                # Update UI using signal (thread-safe)
-                self.status_signal.emit("Capability detection complete")
-                # Emit signal to update UI on main thread
                 self.capability_update_signal.emit()
             except Exception:
                 pass
@@ -2484,9 +2527,6 @@ class CouncilWindow(QtWidgets.QMainWindow):
     @QtCore.Slot()
     def _update_capability_ui(self):
         """Update UI to reflect detected capabilities."""
-        # Use signal to update from background thread
-        self.status_signal.emit("Updating capability indicators...")
-        
         # Check selected models for capabilities
         selected_models = [m for m, cb in self.model_checks.items() if cb.isChecked()]
         
@@ -2787,6 +2827,10 @@ class CouncilWindow(QtWidgets.QMainWindow):
             self.stop_btn.setEnabled(on)
         if hasattr(self, 'send_btn'):
             self.send_btn.setEnabled(not on)
+        for attr in ("connect_btn", "replace_models_btn", "refresh_models_btn", "add_provider_btn", "provider_combo", "api_service_combo", "base_edit", "api_key_inline"):
+            widget = getattr(self, attr, None)
+            if widget is not None:
+                widget.setEnabled(not on)
 
     def _mode_changed(self, index: int):
         """Handle mode selection change."""
