@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import threading
 import uuid
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from core.app_state import app_config_dir, legacy_root_dir
 from core.provider_config import (
@@ -21,8 +22,124 @@ CONFIG_DIR = app_config_dir() if app_config_dir else APP_DIR
 SETTINGS_PATH = CONFIG_DIR / "settings.json"
 LEGACY_SETTINGS_PATH = LEGACY_ROOT / "council_settings.json"
 ACTIVE_API_KEY_REF = "active-provider"
+SETTINGS_SCHEMA_VERSION = 2
 
 _settings_lock = threading.Lock()
+
+
+@dataclass
+class SettingsRecord:
+    schema_version: int = SETTINGS_SCHEMA_VERSION
+    provider_type: str = PROVIDER_LM_STUDIO
+    base_url: str = "http://localhost:1234"
+    api_key: str = ""
+    model_path: str = ""
+    api_service: str = API_SERVICE_CUSTOM
+    debug: bool = False
+    single_voter_enabled: bool = False
+    single_voter_model: str = ""
+    max_concurrency: int = 1
+    roles_enabled: bool = False
+    personas: list[dict[str, Any]] = field(default_factory=list)
+    persona_assignments: dict[str, str] = field(default_factory=dict)
+    provider_profiles: list[dict[str, Any]] = field(default_factory=list)
+    rubric_weights: dict[str, int] = field(default_factory=dict)
+    timeout_seconds: int = 120
+    reduce_motion: bool = False
+    theme_mode: str = "system"
+    window_geometry: str = ""
+    window_state: str = ""
+    secure_keyring_available: bool = False
+    secure_storage_ok: bool = True
+
+
+def _as_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
+def _as_int(value: Any, default: int, *, minimum: Optional[int] = None, maximum: Optional[int] = None) -> int:
+    try:
+        result = int(value)
+    except Exception:
+        result = default
+    if minimum is not None:
+        result = max(minimum, result)
+    if maximum is not None:
+        result = min(maximum, result)
+    return result
+
+
+def _normalize_profile(profile: Any) -> Optional[dict[str, str]]:
+    if not isinstance(profile, dict):
+        return None
+    return {
+        "id": str(profile.get("id") or uuid.uuid4()),
+        "provider_type": str(profile.get("provider_type", PROVIDER_LM_STUDIO)),
+        "api_service": str(profile.get("api_service", API_SERVICE_CUSTOM)),
+        "base_url": str(profile.get("base_url", "")),
+        "api_key": str(profile.get("api_key", "")),
+        "model_path": str(profile.get("model_path", "")),
+    }
+
+
+def _normalize_settings_record(
+    loaded: Optional[dict[str, Any]],
+    *,
+    default_provider_type: str,
+    default_api_service: str,
+) -> dict[str, Any]:
+    raw = dict(loaded or {})
+    schema_version = _as_int(raw.get("schema_version", SETTINGS_SCHEMA_VERSION), SETTINGS_SCHEMA_VERSION, minimum=1)
+    provider_type = str(raw.get("provider_type", default_provider_type))
+    if provider_type == PROVIDER_OLLAMA:
+        default_base_url = "http://localhost:11434"
+    else:
+        default_base_url = "http://localhost:1234"
+
+    record = SettingsRecord(
+        schema_version=SETTINGS_SCHEMA_VERSION,
+        provider_type=provider_type,
+        base_url=str(raw.get("base_url") or default_base_url),
+        api_key=str(raw.get("api_key", "")),
+        model_path=str(raw.get("model_path", "")),
+        api_service=str(raw.get("api_service", default_api_service)),
+        debug=_as_bool(raw.get("debug", False)),
+        single_voter_enabled=_as_bool(raw.get("single_voter_enabled", False)),
+        single_voter_model=str(raw.get("single_voter_model", "")),
+        max_concurrency=_as_int(raw.get("max_concurrency", 1), 1, minimum=1, maximum=8),
+        roles_enabled=_as_bool(raw.get("roles_enabled", False)),
+        personas=[entry for entry in raw.get("personas", []) if isinstance(entry, dict)],
+        persona_assignments={
+            str(key): str(value)
+            for key, value in (raw.get("persona_assignments", {}) or {}).items()
+        } if isinstance(raw.get("persona_assignments", {}), dict) else {},
+        provider_profiles=[
+            normalized
+            for normalized in (_normalize_profile(profile) for profile in raw.get("provider_profiles", []) or [])
+            if normalized is not None
+        ],
+        rubric_weights={
+            str(key): _as_int(value, 0, minimum=0, maximum=10)
+            for key, value in (raw.get("rubric_weights", {}) or {}).items()
+        } if isinstance(raw.get("rubric_weights", {}), dict) else {},
+        timeout_seconds=_as_int(raw.get("timeout_seconds", 120), 120, minimum=15, maximum=600),
+        reduce_motion=_as_bool(raw.get("reduce_motion", False)),
+        theme_mode=str(raw.get("theme_mode", "system")),
+        window_geometry=str(raw.get("window_geometry", "")),
+        window_state=str(raw.get("window_state", "")),
+        secure_keyring_available=_as_bool(raw.get("secure_keyring_available", False)),
+        secure_storage_ok=_as_bool(raw.get("secure_storage_ok", True), default=True),
+    )
+
+    normalized = asdict(record)
+    normalized["settings_migrated_from_schema"] = schema_version
+    return normalized
 
 
 def _profile_secret_name(profile_id: str) -> str:
@@ -110,32 +227,18 @@ def load_settings(
         try:
             loaded = json.loads(path.read_text(encoding="utf-8"))
             loaded, _ = _hydrate_secrets(loaded)
-            provider_type = loaded.get("provider_type", default_provider_type)
-            if provider_type == PROVIDER_OLLAMA:
-                loaded.setdefault("base_url", "http://localhost:11434")
-            else:
-                loaded.setdefault("base_url", "http://localhost:1234")
-            loaded.setdefault("provider_type", provider_type)
-            loaded.setdefault("api_key", "")
-            loaded.setdefault("model_path", "")
-            loaded.setdefault("api_service", default_api_service)
-            return loaded
+            return _normalize_settings_record(
+                loaded,
+                default_provider_type=default_provider_type,
+                default_api_service=default_api_service,
+            )
         except Exception:
             pass
-    defaults = {
-        "provider_type": default_provider_type,
-        "base_url": "http://localhost:1234",
-        "api_key": "",
-        "model_path": "",
-        "api_service": default_api_service,
-        "debug": False,
-        "single_voter_enabled": False,
-        "single_voter_model": "",
-        "max_concurrency": 1,
-        "roles_enabled": False,
-        "personas": [],
-        "persona_assignments": {},
-    }
+    defaults = _normalize_settings_record(
+        {},
+        default_provider_type=default_provider_type,
+        default_api_service=default_api_service,
+    )
     defaults["secure_keyring_available"] = bool(secure_store_available and secure_store_available())
     defaults["secure_storage_ok"] = True
     return defaults
@@ -159,6 +262,12 @@ def save_settings(
                         warning_hook(f"Settings file corrupted, starting fresh: {exc}")
                     current = {}
             current.update(settings_patch or {})
+            current = _normalize_settings_record(
+                current,
+                default_provider_type=str(current.get("provider_type", PROVIDER_LM_STUDIO)),
+                default_api_service=str(current.get("api_service", API_SERVICE_CUSTOM)),
+            )
+            current.pop("settings_migrated_from_schema", None)
             current, secure_save_ok = _strip_persisted_secrets(current)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")

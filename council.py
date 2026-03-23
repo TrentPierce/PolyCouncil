@@ -9,21 +9,46 @@ import aiohttp
 import sqlite3
 import datetime
 import json
+import logging
 import threading
 import re
 import random
 import uuid
 import traceback
+from enum import Enum
 from pathlib import Path
 from typing import Optional, Dict, List, Callable, Awaitable, Any, Iterable, Tuple
 
 from PySide6 import QtCore, QtGui, QtWidgets
+
+from constants import (
+    ACTIONS,
+    FONT_BASE,
+    FONT_LG,
+    FONT_SM,
+    FONT_XL,
+    INTERNAL_GAP,
+    MIN_H,
+    MIN_SIDEBAR,
+    MIN_W,
+    PADDING_LG,
+    PADDING_MD,
+    PADDING_SM,
+    SECTION_GAP,
+    STRINGS,
+    THEME,
+    dp,
+    make_font,
+    refresh_dpi_scale,
+)
+from ui.factories import make_text_browser
 
 # Import new core modules
 try:
     from core.tool_manager import FileParser, ModelCapabilityDetector
     from core.api_client import ModelFetchError, call_model, fetch_models
     from core.discussion_manager import DiscussionManager
+    from core import leaderboard as leaderboard_store
     from core import result_presenter
     from core.personas import (
         DEFAULT_PERSONAS_PATH,
@@ -74,6 +99,7 @@ except ImportError:
     call_model = None
     fetch_models = None
     DiscussionManager = None
+    leaderboard_store = None
     result_presenter = None
     DEFAULT_PERSONAS_PATH = None
     USER_PERSONAS_PATH = None
@@ -126,22 +152,30 @@ try:
 except Exception:
     qdarktheme = None
 
+try:
+    import qasync  # type: ignore
+except Exception:
+    qasync = None
+
 # Import new UI package
 try:
     from ui.theme import ThemeEngine
-    from ui.animations import FadeIn
+    from ui.animations import FadeIn, set_reduce_motion
     from ui.components import (
         CollapsibleGroupBox,
         ModelCard,
+        StatefulRunButton,
         ToastNotification,
         EnhancedPromptEditor,
         AnimatedStatusBar,
         OnboardingOverlay,
         KeyboardShortcutOverlay,
+        WorkflowStepCard,
     )
     _UI_AVAILABLE = True
 except ImportError:
     _UI_AVAILABLE = False
+    set_reduce_motion = None
 
 try:
     from gui import (
@@ -151,6 +185,7 @@ try:
         build_provider_profile_row,
         build_workspace_panel,
         clear_layout,
+        DebugTimelineWidget,
         filter_model_rows,
         make_unique_display_model_name,
         populate_model_rows,
@@ -163,6 +198,7 @@ except ImportError:
     build_provider_profile_row = None
     build_workspace_panel = None
     clear_layout = None
+    DebugTimelineWidget = None
     filter_model_rows = None
     make_unique_display_model_name = None
     populate_model_rows = None
@@ -174,6 +210,7 @@ except ImportError:
 DEBUG_VOTING = True                 # set False to silence
 LOG_TRUNCATE: Optional[int] = None  # e.g., 8000 to cap output, or None for full
 LOG_SINK: Optional[Callable[[str, str], None]] = None
+LOGGER = logging.getLogger(__name__)
 
 def _dbg(label: str, text: Any):
     if not DEBUG_VOTING:
@@ -192,12 +229,25 @@ def _dbg(label: str, text: Any):
             LOG_SINK(label, s)
         except Exception:
             pass
-    print(f"\n===== {label} =====\n{s}\n", flush=True)
+    LOGGER.debug("===== %s =====\n%s", label, s)
 
 
 def set_log_sink(callback: Optional[Callable[[str, str], None]]):
     global LOG_SINK
     LOG_SINK = callback
+
+
+class RightPanelState(str, Enum):
+    PRE_RUN = "pre_run"
+    IN_RUN = "in_run"
+    POST_RUN = "post_run"
+
+
+class RunState(str, Enum):
+    LOCKED = "locked"
+    READY = "ready"
+    RUNNING = "running"
+    STOPPING = "stopping"
 
 def create_app_icon(size: int = 256) -> QtGui.QIcon:
     size = max(64, int(size))
@@ -207,7 +257,7 @@ def create_app_icon(size: int = 256) -> QtGui.QIcon:
     painter = QtGui.QPainter(pixmap)
     painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
 
-    bg_color = QtGui.QColor("#1f80d6")
+    bg_color = QtGui.QColor(THEME["accent"])
     radius = size * 0.2
     bg_path = QtGui.QPainterPath()
     bg_path.addRoundedRect(QtCore.QRectF(0, 0, size, size), radius, radius)
@@ -242,7 +292,7 @@ def create_app_icon(size: int = 256) -> QtGui.QIcon:
         ]
     )
     bubble_path.addPolygon(tail)
-    painter.fillPath(bubble_path, QtGui.QColor("white"))
+    painter.fillPath(bubble_path, QtGui.QColor(THEME["accent_fg"]))
 
     check_pen = QtGui.QPen(bg_color, size * 0.085, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin)
     painter.setPen(check_pen)
@@ -665,6 +715,7 @@ async def council_round(
     web_search: bool = False,
     temperature: Optional[float] = None,
     rubric_weights: Optional[Dict[str, int]] = None,
+    timeout_seconds: int = 120,
     is_cancelled: Optional[Callable[[], bool]] = None
 ):
     status_cb("Collecting answers…")
@@ -687,7 +738,8 @@ async def council_round(
                     session, provider, raw_model, user_prompt,
                     debug_hook=_dbg,
                     temperature=temperature, sys_prompt=sys_p,
-                    images=images, web_search=web_search
+                    images=images, web_search=web_search,
+                    timeout_sec=timeout_seconds,
                 )
                 if isinstance(ans, dict):
                     ans = json.dumps(ans, ensure_ascii=False)
@@ -784,14 +836,21 @@ class ModelFetchWorker(QtCore.QObject):
     finished = QtCore.Signal(list)
     failed = QtCore.Signal(str)
 
-    def __init__(self, provider: ProviderConfig):
+    def __init__(self, provider: ProviderConfig, timeout_seconds: int = 20):
         super().__init__()
         self.provider = provider
+        self.timeout_seconds = max(15, int(timeout_seconds))
 
     @QtCore.Slot()
     def run(self):
         try:
-            models = asyncio.run(fetch_models(self.provider, provider_label=provider_label))
+            models = asyncio.run(
+                fetch_models(
+                    self.provider,
+                    provider_label=provider_label,
+                    timeout_sec=self.timeout_seconds,
+                )
+            )
             self.finished.emit(models)
         except Exception as e:
             self.failed.emit(str(e))
@@ -807,13 +866,20 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PolyCouncil")
-        self.resize(1320, 900)
+        self.setWindowTitle(STRINGS["app_title"])
+        self.resize(max(dp(1320), MIN_W), max(dp(900), MIN_H))
+        self.setMinimumSize(dp(MIN_W), dp(MIN_H))
         self.app_icon = create_app_icon()
         self.setWindowIcon(self.app_icon)
 
         self.use_roles = False
         self.debug_enabled = False
+        self.timeout_seconds = 120
+        self.reduce_motion = False
+        self.right_panel_state = RightPanelState.PRE_RUN
+        self.run_state = RunState.LOCKED
+        self._results_stale = False
+        self._stop_requested = False
         self._model_thread: Optional[QtCore.QThread] = None
         self._model_worker: Optional[ModelFetchWorker] = None
         self.log_history_limit = 500
@@ -830,7 +896,10 @@ class CouncilWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
-        ensure_db()
+        if leaderboard_store:
+            leaderboard_store.ensure_db()
+        else:
+            ensure_db()
 
         self.models: List[str] = []
         self.model_actual_ids: Dict[str, str] = {}
@@ -858,6 +927,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self._fetch_append = False
         self._fetch_provider: Optional[ProviderConfig] = None
         self._status_tone = "neutral"
+        self._winner_stream_timer: Optional[QtCore.QTimer] = None
 
         self._build_ui()
         self._apply_window_style()
@@ -870,6 +940,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self._setup_log_dock()
         self._setup_settings_dock()
         self._connect_signals()
+        self._configure_tab_order()
         set_log_sink(self._log_sink_dispatch)
 
         # Keyboard shortcut overlay
@@ -882,11 +953,16 @@ class CouncilWindow(QtWidgets.QMainWindow):
         s = load_settings()
         self.secure_keyring_available = bool(s.get("secure_keyring_available", False))
         self.secure_storage_ok = bool(s.get("secure_storage_ok", True))
+        self.timeout_seconds = int(s.get("timeout_seconds", 120) or 120)
+        self.reduce_motion = bool(s.get("reduce_motion", False))
+        self.theme_mode = str(s.get("theme_mode", "system") or "system")
         self.provider_type = normalize_provider_type(s.get("provider_type", PROVIDER_LM_STUDIO))
         self.api_key = s.get("api_key", "") or ""
         self.model_path = s.get("model_path", "") or ""
         self.api_service = normalize_api_service(s.get("api_service", API_SERVICE_CUSTOM))
         self.rubric_weights = normalize_rubric_weights(s.get("rubric_weights"))
+        if set_reduce_motion:
+            set_reduce_motion(self.reduce_motion)
         default_base, _ = provider_defaults(self.provider_type)
         self.base_edit.setText(s.get("base_url", default_base))
         self.api_key_inline.setText(self.api_key)
@@ -948,6 +1024,10 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self._set_results_empty_state()
         self._refresh_settings_panel()
         self._refresh_persona_library_panel()
+        self._restore_window_state(s)
+        if self._theme_engine and self.theme_mode in {"light", "dark"}:
+            if self._theme_engine.is_dark != (self.theme_mode == "dark"):
+                self._toggle_theme()
         if not self.secure_keyring_available:
             self._set_status("Secure keychain unavailable. Hosted API keys will only persist for the current session.")
         else:
@@ -962,80 +1042,129 @@ class CouncilWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget()
         central.setObjectName("Root")
         layout = QtWidgets.QVBoxLayout(central)
-        layout.setContentsMargins(16, 16, 16, 12)
-        layout.setSpacing(12)
+        layout.setContentsMargins(dp(PADDING_LG), dp(PADDING_LG), dp(PADDING_LG), dp(PADDING_MD))
+        layout.setSpacing(dp(INTERNAL_GAP))
         self.setCentralWidget(central)
 
         hero = QtWidgets.QFrame()
         hero.setObjectName("HeroCard")
         hero_layout = QtWidgets.QVBoxLayout(hero)
-        hero_layout.setContentsMargins(18, 18, 18, 18)
-        hero_layout.setSpacing(10)
+        hero_layout.setContentsMargins(dp(SECTION_GAP), dp(PADDING_LG), dp(SECTION_GAP), dp(PADDING_LG))
+        hero_layout.setSpacing(dp(INTERNAL_GAP))
 
         nav = QtWidgets.QHBoxLayout()
-        nav.setSpacing(14)
+        nav.setSpacing(dp(PADDING_LG))
         nav.setContentsMargins(0, 0, 0, 0)
         title_block = QtWidgets.QVBoxLayout()
         title_block.setSpacing(2)
         title = QtWidgets.QLabel("PolyCouncil")
         title.setObjectName("HeroTitle")
-        t_font = title.font()
-        t_font.setPointSize(t_font.pointSize() + 6)
-        t_font.setBold(True)
-        title.setFont(t_font)
+        title.setFont(make_font(FONT_XL, bold=True))
         subtitle = QtWidgets.QLabel(
-            "Coordinate multiple models, compare their reasoning, and keep the workflow readable while runs are in flight."
+            "Connect providers, select models, compose once, and review a readable council run without losing the thread."
         )
         subtitle.setObjectName("HeroSubtitle")
         subtitle.setWordWrap(True)
         title_block.addWidget(title)
         title_block.addWidget(subtitle)
 
-        mode_label = QtWidgets.QLabel("Mode:")
+        mode_stack = QtWidgets.QVBoxLayout()
+        mode_stack.setContentsMargins(0, 0, 0, 0)
+        mode_stack.setSpacing(4)
+        mode_label = QtWidgets.QLabel("RUN MODE")
+        mode_label.setObjectName("SectionEyebrow")
         self.mode_combo = QtWidgets.QComboBox()
         self.mode_combo.addItems(["Deliberation Mode", "Collaborative Discussion Mode"])
         self.mode_combo.setCurrentIndex(0)
+        self.mode_combo.setMinimumWidth(dp(220))
         self.settings_btn = QtWidgets.QPushButton("&Settings")
         self.settings_btn.setObjectName("SecondaryButton")
-        self.settings_btn.setMinimumWidth(120)
+        self.settings_btn.setMinimumWidth(dp(128))
         self.settings_btn.setCheckable(True)
         self.settings_btn.setToolTip("Open or close the workspace settings panel.")
+        mode_stack.addWidget(mode_label)
+        mode_stack.addWidget(self.mode_combo)
 
         nav.addLayout(title_block, stretch=1)
-        nav.addWidget(mode_label)
-        nav.addWidget(self.mode_combo)
+        nav.addLayout(mode_stack, stretch=0)
         nav.addWidget(self.settings_btn)
         hero_layout.addLayout(nav)
 
         badge_row = QtWidgets.QHBoxLayout()
-        badge_row.setSpacing(8)
-        self.mode_badge = QtWidgets.QLabel("Deliberation")
-        self.mode_badge.setObjectName("InfoBadge")
-        self.selection_badge = QtWidgets.QLabel("0 models selected")
-        self.selection_badge.setObjectName("InfoBadge")
-        self.attachment_badge = QtWidgets.QLabel("No attachments")
-        self.attachment_badge.setObjectName("InfoBadge")
-        self.tool_badge = QtWidgets.QLabel("Web off")
-        self.tool_badge.setObjectName("InfoBadge")
+        badge_row.setSpacing(dp(PADDING_MD))
+        self.mode_badge = QtWidgets.QLabel("mode: deliberation")
+        self.mode_badge.setObjectName("HeaderStatus")
+        self.connection_btn = QtWidgets.QPushButton("● No models loaded")
+        self.connection_btn.setObjectName("HeaderStatusButton")
+        self.connection_btn.setToolTip("Open provider actions and connection status.")
+        self.selection_badge = QtWidgets.QLabel("sel: 0")
+        self.selection_badge.setObjectName("HeaderStatus")
+        self.attachment_badge = QtWidgets.QLabel("files: 0")
+        self.attachment_badge.setObjectName("HeaderStatus")
+        self.tool_badge = QtWidgets.QLabel("web: off")
+        self.tool_badge.setObjectName("HeaderStatus")
         badge_row.addWidget(self.mode_badge)
-        badge_row.addWidget(self.selection_badge)
-        badge_row.addWidget(self.attachment_badge)
-        badge_row.addWidget(self.tool_badge)
+        badge_row.addWidget(self.connection_btn)
+        self.selection_badge.hide()
+        self.attachment_badge.hide()
+        self.tool_badge.hide()
         badge_row.addStretch(1)
         hero_layout.addLayout(badge_row)
         layout.addWidget(hero)
 
-        # --- Provider Connection (collapsible) ---
-        if _UI_AVAILABLE:
-            self._provider_collapsible = CollapsibleGroupBox("Provider Connection")
-            provider_inner = QtWidgets.QWidget()
-            provider_layout = QtWidgets.QGridLayout(provider_inner)
-        else:
-            provider_group = QtWidgets.QGroupBox("Provider Connection")
-            provider_layout = QtWidgets.QGridLayout(provider_group)
-        provider_layout.setContentsMargins(12, 10, 12, 12)
-        provider_layout.setHorizontalSpacing(10)
-        provider_layout.setVerticalSpacing(8)
+        shell = QtWidgets.QHBoxLayout()
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(dp(INTERNAL_GAP))
+
+        sidebar_col = QtWidgets.QWidget()
+        sidebar_col.setObjectName("SidebarCol")
+        sidebar_layout = QtWidgets.QVBoxLayout(sidebar_col)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setSpacing(dp(INTERNAL_GAP))
+
+        sidebar_scroll = QtWidgets.QScrollArea()
+        sidebar_scroll.setObjectName("PanelScroll")
+        sidebar_scroll.setWidgetResizable(True)
+        sidebar_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        sidebar_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        sidebar_scroll.setWidget(sidebar_col)
+        sidebar_scroll.setMinimumWidth(max(dp(MIN_SIDEBAR), dp(280)))
+        sidebar_scroll.setMaximumWidth(dp(320))
+        sidebar_scroll.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
+
+        workspace_col = QtWidgets.QWidget()
+        workspace_col.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        workspace_layout = QtWidgets.QVBoxLayout(workspace_col)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
+        workspace_layout.setSpacing(dp(INTERNAL_GAP))
+
+        results_col = QtWidgets.QWidget()
+        results_col.setObjectName("ResultsCol")
+        results_layout = QtWidgets.QVBoxLayout(results_col)
+        results_layout.setContentsMargins(0, 0, 0, 0)
+        results_layout.setSpacing(dp(INTERNAL_GAP))
+
+        results_scroll = QtWidgets.QScrollArea()
+        results_scroll.setObjectName("PanelScroll")
+        results_scroll.setWidgetResizable(True)
+        results_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        results_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        results_scroll.setWidget(results_col)
+        results_scroll.setMinimumWidth(dp(360))
+        results_scroll.setMaximumWidth(dp(420))
+        results_scroll.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
+
+        self.step_connect = WorkflowStepCard(
+            1,
+            "Connect",
+            "Choose a provider and load models.",
+            collapsible=True,
+            start_collapsed=False,
+        )
+        provider_layout = QtWidgets.QGridLayout()
+        provider_layout.setContentsMargins(0, 0, 0, 0)
+        provider_layout.setHorizontalSpacing(dp(PADDING_MD))
+        provider_layout.setVerticalSpacing(dp(INTERNAL_GAP))
 
         self.provider_combo = QtWidgets.QComboBox()
         self.provider_combo.addItems([
@@ -1043,7 +1172,6 @@ class CouncilWindow(QtWidgets.QMainWindow):
             provider_label(PROVIDER_OPENAI_COMPAT),
             provider_label(PROVIDER_OLLAMA),
         ])
-        self.provider_combo.setMinimumWidth(220)
 
         self.api_service_combo = QtWidgets.QComboBox()
         self.api_service_combo.addItems([
@@ -1052,7 +1180,6 @@ class CouncilWindow(QtWidgets.QMainWindow):
             api_service_label(API_SERVICE_OPENROUTER),
             api_service_label(API_SERVICE_GEMINI),
         ])
-        self.api_service_combo.setMinimumWidth(170)
         self.api_service_label = QtWidgets.QLabel("API Service")
 
         self.base_edit = QtWidgets.QLineEdit()
@@ -1067,6 +1194,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.connect_btn = QtWidgets.QPushButton("&Load models")
         self.connect_btn.setObjectName("PrimaryButton")
         self.replace_models_btn = QtWidgets.QPushButton("Replace List")
+        self.replace_models_btn.setObjectName("SecondaryButton")
         self.replace_models_btn.setToolTip("Clear the current model list and replace it with the selected provider's models.")
         self.connect_btn.setToolTip("Load models from the provider currently shown here and append them to the model list.")
         self.add_provider_btn = QtWidgets.QPushButton("&Save profile")
@@ -1074,21 +1202,21 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
         provider_layout.addWidget(
             self._create_form_field("Provider", self.provider_combo),
-            0, 0
+            0, 0, 1, 2
         )
         self.api_service_field = self._create_form_field(
             "API Service",
             self.api_service_combo,
             helper_text="Choose a hosted service preset or keep Custom for your own compatible endpoint.",
         )
-        provider_layout.addWidget(self.api_service_field, 0, 1)
+        provider_layout.addWidget(self.api_service_field, 1, 0, 1, 2)
         provider_layout.addWidget(
             self._create_form_field(
                 "Base URL",
                 self.base_edit,
                 helper_text="Use the local or hosted API base URL for the current provider.",
             ),
-            1, 0, 1, 2
+            2, 0, 1, 2
         )
         provider_layout.addWidget(
             self._create_form_field(
@@ -1097,200 +1225,128 @@ class CouncilWindow(QtWidgets.QMainWindow):
                 helper_text="Keys are stored securely when a Windows keychain backend is available.",
                 trailing=self.show_key_check,
             ),
-            2, 0, 1, 2
+            3, 0, 1, 2
         )
-        provider_actions = QtWidgets.QHBoxLayout()
+        provider_actions = QtWidgets.QVBoxLayout()
         provider_actions.setContentsMargins(0, 0, 0, 0)
-        provider_actions.setSpacing(8)
+        provider_actions.setSpacing(dp(PADDING_MD))
         provider_actions.addWidget(self.connect_btn)
-        provider_actions.addWidget(self.replace_models_btn)
-        provider_actions.addWidget(self.add_provider_btn)
-        provider_actions.addStretch(1)
-        provider_layout.addLayout(provider_actions, 3, 0, 1, 2)
+        secondary_provider_actions = QtWidgets.QHBoxLayout()
+        secondary_provider_actions.setContentsMargins(0, 0, 0, 0)
+        secondary_provider_actions.setSpacing(dp(PADDING_MD))
+        secondary_provider_actions.addWidget(self.replace_models_btn)
+        secondary_provider_actions.addWidget(self.add_provider_btn)
+        provider_actions.addLayout(secondary_provider_actions)
+        provider_layout.addLayout(provider_actions, 4, 0, 1, 2)
         provider_layout.setColumnStretch(0, 1)
         provider_layout.setColumnStretch(1, 1)
-        if _UI_AVAILABLE:
-            self._provider_collapsible.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
-        else:
-            provider_group.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
+        provider_container = QtWidgets.QWidget()
+        provider_container.setLayout(provider_layout)
+        self.step_connect.add_widget(provider_container)
 
-        # --- Run Settings (collapsible) ---
-        if _UI_AVAILABLE:
-            self._session_collapsible = CollapsibleGroupBox("Run Settings")
-            session_inner = QtWidgets.QWidget()
-            session_layout = QtWidgets.QGridLayout(session_inner)
-        else:
-            session_group = QtWidgets.QGroupBox("Run Settings")
-            session_layout = QtWidgets.QGridLayout(session_group)
-        session_layout.setContentsMargins(12, 10, 12, 12)
-        session_layout.setHorizontalSpacing(10)
-        session_layout.setVerticalSpacing(8)
-
-        self.single_voter_check = QtWidgets.QCheckBox("Single-voter")
-        self.single_voter_combo = QtWidgets.QComboBox()
-        self.single_voter_combo.setMinimumWidth(220)
-
-        self.conc_label = QtWidgets.QLabel("Max concurrent jobs")
-        self.conc_spin = QtWidgets.QSpinBox()
-        self.conc_spin.setRange(1, 8)
-        self.conc_spin.setValue(1)
-        self.web_search_check = QtWidgets.QCheckBox("Enable Web Search")
-        self.web_search_check.setEnabled(False)
-        self.web_search_check.setToolTip("Enable only when a selected model exposes web tools.")
-        self.mode_help_label = QtWidgets.QLabel(
-            "Use the header mode switch to choose weighted deliberation or collaborative discussion."
-        )
-        self.mode_help_label.setObjectName("HintLabel")
-        self.mode_help_label.setWordWrap(True)
-
-        session_layout.addWidget(self.mode_help_label, 0, 0, 1, 2)
-        self.single_voter_field = self._create_form_field(
-            "Voting Mode",
-            self.single_voter_combo,
-            helper_text="Enable single-voter mode to let one selected model judge all candidates.",
-            trailing=self.single_voter_check,
-        )
-        session_layout.addWidget(self.single_voter_field, 1, 0, 1, 2)
-        session_layout.addWidget(
-            self._create_form_field(
-                "Concurrency",
-                self.conc_spin,
-                helper_text="Keep this low on local hardware for steadier runs.",
-            ),
-            2, 0
-        )
-        session_layout.addWidget(
-            self._create_form_field(
-                "Tools",
-                self.web_search_check,
-                helper_text="Turn web tools on only when the selected models support them.",
-            ),
-            2, 1
-        )
-        session_layout.setColumnStretch(0, 1)
-        session_layout.setColumnStretch(1, 1)
-        if _UI_AVAILABLE:
-            self._session_collapsible.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
-        else:
-            session_group.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
-
-        # Assemble the controls area
-        controls_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        controls_splitter.setChildrenCollapsible(False)
-        controls_splitter.setHandleWidth(1)
-        controls_splitter.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
-        if _UI_AVAILABLE:
-            self._provider_collapsible.add_widget(provider_inner)
-            self._session_collapsible.add_widget(session_inner)
-            controls_splitter.addWidget(self._provider_collapsible)
-            controls_splitter.addWidget(self._session_collapsible)
-        else:
-            controls_splitter.addWidget(provider_group)
-            controls_splitter.addWidget(session_group)
-        controls_splitter.setSizes([700, 420])
-        layout.addWidget(controls_splitter)
-
-        # --- Saved Provider Profiles (collapsible, starts collapsed) ---
-        if _UI_AVAILABLE:
-            self._profiles_collapsible = CollapsibleGroupBox("Saved Provider Profiles", start_collapsed=True)
-            profiles_content = QtWidgets.QWidget()
-            providers_group_layout = QtWidgets.QVBoxLayout(profiles_content)
-        else:
-            providers_group = QtWidgets.QGroupBox("Saved Provider Profiles")
-            providers_group_layout = QtWidgets.QVBoxLayout(providers_group)
-        providers_group_layout.setContentsMargins(14, 12, 14, 14)
-        providers_group_layout.setSpacing(8)
-        providers_help = QtWidgets.QLabel(
-            "Keep reusable endpoints here. Use loads the profile into the form, and Load fetches models from that saved provider."
-        )
-        providers_help.setObjectName("HintLabel")
-        providers_help.setWordWrap(True)
-        providers_group_layout.addWidget(providers_help)
+        profiles_label = QtWidgets.QLabel("Saved provider profiles")
+        profiles_label.setObjectName("FieldLabel")
+        self.step_connect.add_widget(profiles_label)
         self.providers_scroll = QtWidgets.QScrollArea()
+        self.providers_scroll.setObjectName("PanelScroll")
         self.providers_scroll.setWidgetResizable(True)
         self.providers_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.providers_inner = QtWidgets.QWidget()
         self.providers_layout = QtWidgets.QVBoxLayout(self.providers_inner)
         self.providers_layout.setContentsMargins(0, 0, 0, 0)
-        self.providers_layout.setSpacing(6)
+        self.providers_layout.setSpacing(dp(PADDING_SM))
         self.providers_layout.addStretch(1)
         self.providers_scroll.setWidget(self.providers_inner)
-        providers_group_layout.addWidget(self.providers_scroll)
-        if _UI_AVAILABLE:
-            self._profiles_collapsible.add_widget(profiles_content)
-            layout.addWidget(self._profiles_collapsible)
-        else:
-            providers_group.setMaximumHeight(220)
-            layout.addWidget(providers_group)
+        self.providers_scroll.setMaximumHeight(dp(180))
+        self.step_connect.add_widget(self.providers_scroll)
+        sidebar_layout.addWidget(self.step_connect)
 
-        main_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
-        main_splitter.setChildrenCollapsible(False)
-
-        sidebar_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
-        sidebar_splitter.setChildrenCollapsible(False)
-
-        models_group = QtWidgets.QGroupBox("Model Selection")
-        models_layout = QtWidgets.QVBoxLayout(models_group)
-        models_layout.setContentsMargins(12, 16, 12, 12)
-        models_layout.setSpacing(10)
+        self.step_models = WorkflowStepCard(
+            2,
+            "Select models",
+            "Load models to unlock selection.",
+            collapsible=True,
+            start_collapsed=False,
+        )
+        models_container = QtWidgets.QWidget()
+        models_layout = QtWidgets.QVBoxLayout()
+        models_layout.setContentsMargins(0, 0, 0, 0)
+        models_layout.setSpacing(dp(INTERNAL_GAP))
         self.model_filter_edit = QtWidgets.QLineEdit()
         self.model_filter_edit.setPlaceholderText("Filter models by provider, capability, or name")
         self.model_selection_label = QtWidgets.QLabel("0 selected of 0 loaded")
         self.model_selection_label.setObjectName("HintLabel")
-        model_btn_row = QtWidgets.QHBoxLayout()
+        model_actions = QtWidgets.QGridLayout()
+        model_actions.setContentsMargins(0, 0, 0, 0)
+        model_actions.setHorizontalSpacing(dp(PADDING_MD))
+        model_actions.setVerticalSpacing(dp(PADDING_MD))
         self.refresh_models_btn = QtWidgets.QPushButton("&Reload provider")
+        self.refresh_models_btn.setObjectName("SecondaryButton")
         self.select_all_btn = QtWidgets.QPushButton("Select &All")
         self.clear_btn = QtWidgets.QPushButton("Select &None")
         self.clear_model_list_btn = QtWidgets.QPushButton("Clear Models")
         self.refresh_models_btn.setToolTip("Reload models from the provider currently shown in the provider card.")
         self.clear_model_list_btn.setToolTip("Remove all loaded models from all providers.")
-        model_btn_row.addWidget(self.refresh_models_btn)
-        model_btn_row.addWidget(self.select_all_btn)
-        model_btn_row.addWidget(self.clear_btn)
-        model_btn_row.addWidget(self.clear_model_list_btn)
+        model_actions.addWidget(self.refresh_models_btn, 0, 0)
+        model_actions.addWidget(self.clear_model_list_btn, 0, 1)
+        model_actions.addWidget(self.select_all_btn, 1, 0)
+        model_actions.addWidget(self.clear_btn, 1, 1)
         self.models_area = QtWidgets.QScrollArea()
+        self.models_area.setObjectName("PanelScroll")
         self.models_area.setWidgetResizable(True)
-        self.models_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.models_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.models_inner = QtWidgets.QWidget()
         self.models_layout = QtWidgets.QVBoxLayout(self.models_inner)
-        self.models_layout.setContentsMargins(6, 6, 6, 6)
-        self.models_layout.setSpacing(4)
+        self.models_layout.setContentsMargins(2, 2, 2, 2)
+        self.models_layout.setSpacing(dp(PADDING_SM))
         self.models_layout.addStretch(1)
         self.models_area.setWidget(self.models_inner)
         models_layout.addWidget(self.model_filter_edit)
         models_layout.addWidget(self.model_selection_label)
-        models_layout.addLayout(model_btn_row)
+        models_layout.addLayout(model_actions)
         models_layout.addWidget(self.models_area, stretch=1)
+        models_container.setLayout(models_layout)
+        self.step_models.add_widget(models_container)
+        sidebar_layout.addWidget(self.step_models, 1)
 
-        self.leaderboard_group = QtWidgets.QGroupBox("Leaderboard")
-        leaderboard_layout = QtWidgets.QVBoxLayout(self.leaderboard_group)
-        leaderboard_layout.setContentsMargins(12, 16, 12, 12)
-        leaderboard_layout.setSpacing(10)
+        self.step_history = WorkflowStepCard(
+            3,
+            "History",
+            "Past winners and tracked performance.",
+            collapsible=True,
+            start_collapsed=True,
+        )
+        self.leaderboard_group = self.step_history
+        leaderboard_container = QtWidgets.QWidget()
+        leaderboard_layout = QtWidgets.QVBoxLayout(leaderboard_container)
+        leaderboard_layout.setContentsMargins(0, 0, 0, 0)
+        leaderboard_layout.setSpacing(dp(INTERNAL_GAP))
         lb_header = QtWidgets.QHBoxLayout()
         self.lb_title = QtWidgets.QLabel("Council performance over time")
         self.lb_title.setObjectName("HintLabel")
         self.reset_btn = QtWidgets.QPushButton("Reset")
+        self.reset_btn.setObjectName("SecondaryButton")
         lb_header.addWidget(self.lb_title)
         lb_header.addStretch(1)
         lb_header.addWidget(self.reset_btn)
         self.leader_list = QtWidgets.QListWidget()
+        self.leader_list.setObjectName("LeaderboardList")
+        self.leader_list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.leader_list.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.leader_list.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.leader_list.setSpacing(dp(PADDING_SM))
         leaderboard_layout.addLayout(lb_header)
         leaderboard_layout.addWidget(self.leader_list, stretch=1)
+        self.step_history.add_widget(leaderboard_container)
+        sidebar_layout.addWidget(self.step_history)
 
-        sidebar_splitter.addWidget(models_group)
-        sidebar_splitter.addWidget(self.leaderboard_group)
-        sidebar_splitter.setSizes([620, 240])
-        main_splitter.addWidget(sidebar_splitter)
-
-        workspace_group = QtWidgets.QGroupBox("Workspace")
-        workspace_layout = QtWidgets.QVBoxLayout(workspace_group)
-        workspace_layout.setContentsMargins(12, 16, 12, 12)
-        workspace_layout.setSpacing(10)
-
-        attachment_group = QtWidgets.QGroupBox("Context & Attachments")
-        attachment_layout = QtWidgets.QVBoxLayout(attachment_group)
-        attachment_layout.setContentsMargins(12, 12, 12, 12)
-        attachment_layout.setSpacing(8)
+        attachment_group, attachment_layout = self._create_panel_card(
+            "Context",
+            "Attachments",
+            "Drop or upload files before you run. They are added to the next council request.",
+        )
+        attachment_layout.setContentsMargins(0, 0, 0, 0)
+        attachment_layout.setSpacing(dp(PADDING_MD))
         file_btn_row = QtWidgets.QHBoxLayout()
         self.upload_btn = QtWidgets.QPushButton("&Upload files")
         self.upload_btn.setObjectName("SecondaryButton")
@@ -1302,30 +1358,23 @@ class CouncilWindow(QtWidgets.QMainWindow):
         file_btn_row.addWidget(self.remove_file_btn)
         file_btn_row.addWidget(self.clear_files_btn)
         file_btn_row.addStretch(1)
-        file_btn_row.addWidget(self.visual_status)
         self.files_list = AttachmentListWidget()
-        self.files_list.setMaximumHeight(96)
+        self.files_list.setMaximumHeight(dp(112))
         self.files_list.setToolTip("Uploaded files are parsed and added to the council context. Double-click an item to remove it.")
-        attachment_layout.addLayout(file_btn_row)
-        attachment_layout.addWidget(self.files_list)
-
-        workspace_header = QtWidgets.QHBoxLayout()
-        chat_title = QtWidgets.QLabel("Council Feed")
-        chat_title.setObjectName("SectionTitle")
-        self.attachment_help_label = QtWidgets.QLabel("Upload supporting files or drag them into the attachment area before you send.")
+        self.attachment_help_label = QtWidgets.QLabel("No attachments loaded yet.")
         self.attachment_help_label.setObjectName("HintLabel")
         self.attachment_help_label.setWordWrap(True)
-        workspace_header.addWidget(chat_title)
-        workspace_header.addStretch(1)
-        workspace_layout.addWidget(attachment_group)
-        workspace_layout.addLayout(workspace_header)
-        workspace_layout.addWidget(self.attachment_help_label)
+        attachment_layout.addLayout(file_btn_row)
+        attachment_layout.addWidget(self.attachment_help_label)
+        attachment_layout.addWidget(self.files_list)
+        attachment_layout.addWidget(self.visual_status)
+        self.visual_status.hide()
 
         self.run_banner = QtWidgets.QFrame()
         self.run_banner.setObjectName("ComposerCard")
         run_banner_layout = QtWidgets.QHBoxLayout(self.run_banner)
-        run_banner_layout.setContentsMargins(12, 10, 12, 10)
-        run_banner_layout.setSpacing(10)
+        run_banner_layout.setContentsMargins(dp(PADDING_LG), dp(PADDING_MD), dp(PADDING_LG), dp(PADDING_MD))
+        run_banner_layout.setSpacing(dp(INTERNAL_GAP))
         self.run_banner_badge = QtWidgets.QLabel("Ready")
         self.run_banner_badge.setObjectName("StatusBadge")
         self.run_banner_text = QtWidgets.QLabel(
@@ -1337,14 +1386,24 @@ class CouncilWindow(QtWidgets.QMainWindow):
         run_banner_layout.addWidget(self.run_banner_text, 1)
         workspace_layout.addWidget(self.run_banner)
 
+        feed_card, feed_body = self._create_panel_card(
+            "Workspace",
+            "Council feed",
+            "Active run updates, council notes, and status messages appear here in order.",
+        )
         self.chat_view = self._create_output_view()
-        workspace_layout.addWidget(self.chat_view, stretch=1)
+        feed_body.addWidget(self.chat_view, stretch=1)
+        workspace_layout.addWidget(feed_card, stretch=1)
 
         composer = QtWidgets.QFrame()
         composer.setObjectName("ComposerCard")
         composer_layout = QtWidgets.QVBoxLayout(composer)
-        composer_layout.setContentsMargins(12, 12, 12, 12)
-        composer_layout.setSpacing(8)
+        composer_layout.setContentsMargins(dp(PADDING_LG), dp(PADDING_LG), dp(PADDING_LG), dp(PADDING_LG))
+        composer_layout.setSpacing(dp(PADDING_MD))
+        composer_eyebrow = QtWidgets.QLabel("COMPOSE")
+        composer_eyebrow.setObjectName("SectionEyebrow")
+        composer_title = QtWidgets.QLabel("Prompt")
+        composer_title.setObjectName("PanelTitle")
         if _UI_AVAILABLE:
             self.prompt_edit = EnhancedPromptEditor()
         else:
@@ -1356,53 +1415,193 @@ class CouncilWindow(QtWidgets.QMainWindow):
         if _UI_AVAILABLE:
             self.composer_hint_label.hide()  # EnhancedPromptEditor has its own hint
         composer_actions = QtWidgets.QHBoxLayout()
-        composer_actions.setSpacing(8)
+        composer_actions.setSpacing(dp(PADDING_MD))
+        composer_actions.addWidget(self.upload_btn)
+        composer_actions.addWidget(self.remove_file_btn)
+        composer_actions.addWidget(self.clear_files_btn)
         composer_actions.addStretch(1)
-        self.send_btn = QtWidgets.QPushButton("&Run council")
-        self.send_btn.setObjectName("PrimaryButton")
-        self.stop_btn = QtWidgets.QPushButton("S&top run")
-        self.stop_btn.setObjectName("DangerButton")
-        self.stop_btn.setEnabled(False)
-        composer_actions.addWidget(self.send_btn)
-        composer_actions.addWidget(self.stop_btn)
+        self.run_btn = StatefulRunButton() if _UI_AVAILABLE else QtWidgets.QPushButton("Run council")
+        if not _UI_AVAILABLE:
+            self.run_btn.setObjectName("PrimaryButton")
+            self.run_btn.setEnabled(False)
+        self.send_btn = self.run_btn
+        composer_actions.addWidget(self.run_btn)
+        composer_layout.addWidget(composer_eyebrow)
+        composer_layout.addWidget(composer_title)
+        composer_layout.addWidget(self.attachment_help_label)
+        composer_layout.addWidget(self.files_list)
         composer_layout.addWidget(self.prompt_edit)
         composer_layout.addWidget(self.composer_hint_label)
         composer_layout.addLayout(composer_actions)
         workspace_layout.addWidget(composer)
-        main_splitter.addWidget(workspace_group)
 
-        results_group = QtWidgets.QGroupBox("Results")
-        results_layout = QtWidgets.QVBoxLayout(results_group)
-        results_layout.setContentsMargins(12, 16, 12, 12)
-        results_layout.setSpacing(10)
-        right_header = QtWidgets.QHBoxLayout()
-        self.tabs_title = QtWidgets.QLabel("Per-Model Answers")
-        self.tabs_title.setObjectName("SectionTitle")
+        run_config_card, run_config_body = self._create_panel_card(
+            "Configure",
+            "Run configuration",
+            "",
+        )
+        self.single_voter_check = QtWidgets.QCheckBox("Use single voter")
+        self.single_voter_combo = QtWidgets.QComboBox()
+        self.conc_label = QtWidgets.QLabel("Max concurrent jobs")
+        self.conc_spin = QtWidgets.QSpinBox()
+        self.conc_spin.setRange(1, 8)
+        self.conc_spin.setValue(1)
+        self.run_timeout_spin = QtWidgets.QSpinBox()
+        self.run_timeout_spin.setRange(15, 600)
+        self.run_timeout_spin.setSuffix(" s")
+        self.run_timeout_spin.setValue(int(getattr(self, "timeout_seconds", 90)))
+        self.web_search_check = QtWidgets.QCheckBox("Enable web search")
+        self.web_search_check.setEnabled(False)
+        self.web_search_check.setToolTip("Enable only when a selected model exposes web tools.")
+        self.mode_help_label = QtWidgets.QLabel(
+            "Weighted deliberation compares answers and ballots. Discussion mode runs a collaborative round-table instead."
+        )
+        self.mode_help_label.setObjectName("HintLabel")
+        self.mode_help_label.setWordWrap(True)
+        config_grid = QtWidgets.QGridLayout()
+        config_grid.setContentsMargins(0, 0, 0, 0)
+        config_grid.setHorizontalSpacing(10)
+        config_grid.setVerticalSpacing(8)
+        self.single_voter_field = self._create_form_field(
+            "Voting mode",
+            self.single_voter_combo,
+            helper_text="Turn this on to let one selected model judge all candidates.",
+            trailing=self.single_voter_check,
+        )
+        config_grid.addWidget(self.mode_help_label, 0, 0, 1, 2)
+        config_grid.addWidget(self.single_voter_field, 1, 0, 1, 2)
+        config_grid.addWidget(
+            self._create_form_field(
+                "Concurrency",
+                self.conc_spin,
+                helper_text="Keep this low on local hardware.",
+            ),
+            2,
+            0,
+        )
+        config_grid.addWidget(
+            self._create_form_field(
+                "Timeout",
+                self.run_timeout_spin,
+                helper_text="Per-request timeout for model calls.",
+            ),
+            2,
+            1,
+        )
+        config_grid.addWidget(
+            self._create_form_field(
+                "Tools",
+                self.web_search_check,
+                helper_text="Use only when selected models support it.",
+            ),
+            3,
+            0,
+            1,
+            2,
+        )
+        run_config_body.addLayout(config_grid)
+
+        self.right_panel_stack = QtWidgets.QStackedWidget()
+
+        pre_run_page = QtWidgets.QWidget()
+        pre_run_layout = QtWidgets.QVBoxLayout(pre_run_page)
+        pre_run_layout.setContentsMargins(0, 0, 0, 0)
+        pre_run_layout.setSpacing(12)
+        self.pre_run_warning_label = QtWidgets.QLabel("")
+        self.pre_run_warning_label.setObjectName("HintLabel")
+        self.pre_run_warning_label.setWordWrap(True)
+        self.pre_run_warning_label.hide()
+        self.pre_run_placeholder = self._create_output_view()
+        self.pre_run_placeholder.setHtml(
+            self._placeholder_html(
+                "Results will appear here",
+                "Finish setup, run the council, and this panel will switch from configuration to result review automatically.",
+            )
+        )
+        pre_run_layout.addWidget(run_config_card)
+        pre_run_layout.addWidget(self.pre_run_warning_label)
+        pre_run_layout.addWidget(self.pre_run_placeholder, 1)
+
+        in_run_page = QtWidgets.QWidget()
+        in_run_layout = QtWidgets.QVBoxLayout(in_run_page)
+        in_run_layout.setContentsMargins(0, 0, 0, 0)
+        in_run_layout.setSpacing(12)
+        in_run_card, in_run_body = self._create_panel_card(
+            "Running",
+            "Council in progress",
+            "The active run state, progress, and streamed updates live here until the round completes.",
+        )
+        self.in_run_status_label = QtWidgets.QLabel("Preparing run…")
+        self.in_run_status_label.setObjectName("PanelTitle")
+        self.in_run_progress_label = QtWidgets.QLabel("Waiting for model responses.")
+        self.in_run_progress_label.setObjectName("HintLabel")
+        self.in_run_progress_label.setWordWrap(True)
+        self.in_run_live_view = self._create_output_view()
+        in_run_body.addWidget(self.in_run_status_label)
+        in_run_body.addWidget(self.in_run_progress_label)
+        in_run_body.addWidget(self.in_run_live_view, 1)
+        in_run_layout.addWidget(in_run_card, 1)
+
+        post_run_page = QtWidgets.QWidget()
+        post_run_layout = QtWidgets.QVBoxLayout(post_run_page)
+        post_run_layout.setContentsMargins(0, 0, 0, 0)
+        post_run_layout.setSpacing(12)
+        results_group, results_group_layout = self._create_panel_card(
+            "Review",
+            "Results",
+            "Winner, ballots, selected model detail, and logs stay in one stable review surface.",
+        )
+        self.tabs_title = QtWidgets.QLabel("Council results")
+        self.tabs_title.setObjectName("PanelTitle")
         self.results_hint_label = QtWidgets.QLabel("Run a council round to populate model outputs, scoring, and exports.")
         self.results_hint_label.setObjectName("HintLabel")
+        self.results_hint_label.setWordWrap(True)
         self.results_stage_label = QtWidgets.QLabel("Idle")
         self.results_stage_label.setObjectName("StatusBadge")
-        right_header.addWidget(self.tabs_title)
-        right_header.addStretch(1)
-        right_header.addWidget(self.results_stage_label)
+        results_header = QtWidgets.QHBoxLayout()
+        results_header.setContentsMargins(0, 0, 0, 0)
+        results_header.setSpacing(8)
+        results_header.addWidget(self.tabs_title)
+        results_header.addStretch(1)
+        results_header.addWidget(self.results_stage_label)
         self.replay_last_btn = QtWidgets.QPushButton("&Replay last")
+        self.replay_last_btn.setObjectName("SecondaryButton")
         self.export_json_btn = QtWidgets.QPushButton("Export &JSON")
-        right_header.addWidget(self.replay_last_btn)
-        right_header.addWidget(self.export_json_btn)
+        self.export_json_btn.setObjectName("SecondaryButton")
+        results_actions = QtWidgets.QHBoxLayout()
+        results_actions.setContentsMargins(0, 0, 0, 0)
+        results_actions.setSpacing(8)
+        results_actions.addWidget(self.replay_last_btn)
+        results_actions.addWidget(self.export_json_btn)
+        results_actions.addStretch(1)
         self.tabs = QtWidgets.QTabWidget()
         self.tabs.setDocumentMode(True)
         self.tabs.setUsesScrollButtons(True)
-        results_layout.addLayout(right_header)
-        results_layout.addWidget(self.results_hint_label)
-        results_layout.addWidget(self.tabs, stretch=1)
+        results_group_layout.addLayout(results_header)
+        results_group_layout.addWidget(self.results_hint_label)
+        results_group_layout.addLayout(results_actions)
+        results_group_layout.addWidget(self.tabs, stretch=1)
         self._init_results_tabs()
-        main_splitter.addWidget(results_group)
 
-        main_splitter.setStretchFactor(0, 2)
-        main_splitter.setStretchFactor(1, 3)
-        main_splitter.setStretchFactor(2, 3)
-        main_splitter.setSizes([360, 520, 520])
-        layout.addWidget(main_splitter, stretch=1)
+        self.run_config_used_collapsible = CollapsibleGroupBox("Run config used", start_collapsed=True) if _UI_AVAILABLE else None
+        self.run_config_used_view = self._create_output_view()
+        if self.run_config_used_collapsible:
+            self.run_config_used_collapsible.add_widget(self.run_config_used_view)
+            post_run_layout.addWidget(results_group, 1)
+            post_run_layout.addWidget(self.run_config_used_collapsible)
+        else:
+            post_run_layout.addWidget(results_group, 1)
+            post_run_layout.addWidget(self.run_config_used_view)
+
+        self.right_panel_stack.addWidget(pre_run_page)
+        self.right_panel_stack.addWidget(in_run_page)
+        self.right_panel_stack.addWidget(post_run_page)
+        results_layout.addWidget(self.right_panel_stack, 1)
+
+        shell.addWidget(sidebar_scroll, 0)
+        shell.addWidget(workspace_col, 1)
+        shell.addWidget(results_scroll, 0)
+        layout.addLayout(shell, stretch=1)
 
         bottom = QtWidgets.QHBoxLayout()
         bottom.setContentsMargins(0, 0, 0, 0)
@@ -1435,15 +1634,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
         layout.addLayout(bottom)
 
     def _create_output_view(self) -> QtWidgets.QTextBrowser:
-        view = QtWidgets.QTextBrowser()
-        view.setOpenExternalLinks(True)
-        view.setReadOnly(True)
-        view.setUndoRedoEnabled(False)
-        view.setFrameShape(QtWidgets.QFrame.NoFrame)
-        view.setLineWrapMode(QtWidgets.QTextEdit.WidgetWidth)
-        view.setWordWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
-        view.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        view.document().setDocumentMargin(12)
+        view = make_text_browser("OutputView")
         self._apply_output_view_theme(view)
         return view
 
@@ -1458,25 +1649,60 @@ class CouncilWindow(QtWidgets.QMainWindow):
         wrapper = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(wrapper)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(dp(PADDING_MD))
         label = QtWidgets.QLabel(label_text)
-        label.setObjectName("SectionTitle")
+        label.setObjectName("FieldLabel")
+        label.setBuddy(control)
         layout.addWidget(label)
         if trailing is None:
             layout.addWidget(control)
         else:
             row = QtWidgets.QHBoxLayout()
             row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(8)
+            row.setSpacing(dp(PADDING_MD))
             row.addWidget(control, 1)
             row.addWidget(trailing, 0)
             layout.addLayout(row)
         if helper_text:
             helper = QtWidgets.QLabel(helper_text)
-            helper.setObjectName("HintLabel")
+            helper.setObjectName("FieldHelper")
             helper.setWordWrap(True)
             layout.addWidget(helper)
         return wrapper
+
+    def _create_panel_card(
+        self,
+        eyebrow: str,
+        title: str,
+        description: str = "",
+    ) -> tuple[QtWidgets.QFrame, QtWidgets.QVBoxLayout]:
+        panel = QtWidgets.QFrame()
+        panel.setObjectName("PanelCard")
+        layout = QtWidgets.QVBoxLayout(panel)
+        layout.setContentsMargins(dp(PADDING_LG), dp(PADDING_LG), dp(PADDING_LG), dp(PADDING_LG))
+        layout.setSpacing(dp(INTERNAL_GAP))
+
+        if eyebrow:
+            eyebrow_label = QtWidgets.QLabel(eyebrow.upper())
+            eyebrow_label.setObjectName("SectionEyebrow")
+            layout.addWidget(eyebrow_label)
+
+        if title:
+            title_label = QtWidgets.QLabel(title)
+            title_label.setObjectName("PanelTitle")
+            layout.addWidget(title_label)
+
+        if description:
+            description_label = QtWidgets.QLabel(description)
+            description_label.setObjectName("HintLabel")
+            description_label.setWordWrap(True)
+            layout.addWidget(description_label)
+
+        body = QtWidgets.QVBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(dp(INTERNAL_GAP))
+        layout.addLayout(body, 1)
+        return panel, body
 
     def _init_results_tabs(self):
         self.tabs.clear()
@@ -1489,7 +1715,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.results_discussion_view = self._create_output_view()
 
         self.selected_model_list = QtWidgets.QListWidget()
-        self.selected_model_list.setMaximumWidth(240)
+        self.selected_model_list.setMinimumWidth(dp(160))
+        self.selected_model_list.setMaximumWidth(dp(200))
         self.selected_model_list.currentTextChanged.connect(self._refresh_selected_model_detail)
         self.selected_model_detail_view = self._create_output_view()
         selected_model_page = QtWidgets.QWidget()
@@ -1500,6 +1727,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
         selected_model_layout.addWidget(self.selected_model_detail_view, 1)
 
         self.inline_log_view = QtWidgets.QPlainTextEdit()
+        self.inline_log_view.setObjectName("OutputLog")
         self.inline_log_view.setReadOnly(True)
         self.inline_log_view.setMaximumBlockCount(self.log_history_limit)
 
@@ -1645,10 +1873,12 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self._refresh_output_document_styles()
         self._set_badge_tone(self.status_badge, "neutral")
 
-    def _set_badge_tone(self, badge: QtWidgets.QLabel, tone: str):
+    def _set_badge_tone(self, badge: QtWidgets.QWidget, tone: str):
         badge.setProperty("tone", tone)
-        badge.style().unpolish(badge)
-        badge.style().polish(badge)
+        style = badge.style()
+        if style:
+            style.unpolish(badge)
+            style.polish(badge)
         badge.update()
 
     def _palette_hex(self, role: QtGui.QPalette.ColorRole) -> str:
@@ -1683,12 +1913,12 @@ class CouncilWindow(QtWidgets.QMainWindow):
             "panel": self._palette_hex(QtGui.QPalette.Base),
             "panel_alt": self._palette_hex(QtGui.QPalette.AlternateBase),
             "panel_subtle": self._palette_hex(QtGui.QPalette.Window),
-            "accent": "#2d7dd2",
+            "accent": THEME["accent"],
             "accent_muted": self._palette_hex(QtGui.QPalette.AlternateBase),
-            "danger": "#b94b4b",
-            "danger_bg": "#ffe8e8",
-            "success": "#2e7d32",
-            "success_bg": "#e8f5e9",
+            "danger": THEME["danger"],
+            "danger_bg": THEME["bg_tertiary"],
+            "success": THEME["success"],
+            "success_bg": THEME["bg_tertiary"],
         }
 
     def _output_document_css(self) -> str:
@@ -1698,21 +1928,21 @@ class CouncilWindow(QtWidgets.QMainWindow):
             background: transparent;
             color: {c["text_primary"]};
             font-family: "Segoe UI";
-            font-size: 13px;
-            line-height: 1.5;
+            font-size: {FONT_BASE}pt;
+            line-height: 1.4;
         }}
         p, ul, ol {{
             margin-top: 0;
-            margin-bottom: 10px;
+            margin-bottom: {PADDING_MD}px;
             color: {c["text_primary"]};
         }}
         li {{
-            margin-bottom: 4px;
+            margin-bottom: {PADDING_SM}px;
         }}
         h1, h2, h3, h4, h5, h6 {{
             color: {c["text_primary"]};
             margin-top: 0;
-            margin-bottom: 8px;
+            margin-bottom: {PADDING_MD}px;
         }}
         a {{
             color: {c["accent"]};
@@ -1720,21 +1950,21 @@ class CouncilWindow(QtWidgets.QMainWindow):
         code {{
             color: {c["text_primary"]};
             background: {c["panel_subtle"]};
-            border-radius: 6px;
-            padding: 1px 4px;
+            border-radius: {PADDING_SM}px;
+            padding: 1px {PADDING_SM}px;
         }}
         pre {{
             white-space: pre-wrap;
             color: {c["text_primary"]};
             background: {c["panel_subtle"]};
             border: 1px solid {c["border"]};
-            border-radius: 10px;
-            padding: 10px 12px;
-            margin: 0 0 12px 0;
+            border-radius: {PADDING_MD}px;
+            padding: {PADDING_MD}px {PADDING_LG}px;
+            margin: 0 0 {PADDING_LG}px 0;
         }}
         blockquote {{
-            margin: 0 0 12px 0;
-            padding: 0 0 0 12px;
+            margin: 0 0 {PADDING_LG}px 0;
+            padding: 0 0 0 {PADDING_LG}px;
             border-left: 3px solid {c["border"]};
             color: {c["text_secondary"]};
         }}
@@ -1774,8 +2004,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
     def _placeholder_html(self, title: str, message: str) -> str:
         colors = self._surface_tokens()
         return f"""
-        <div style="border:1px solid {colors['border']}; border-radius:16px; padding:18px; background:{colors['panel_subtle']};">
-            <div style="font-size:16px; font-weight:700; color:{colors['text_primary']}; margin-bottom:6px;">{title}</div>
+        <div style="border:1px solid {colors['border']}; border-radius:{PADDING_LG}px; padding:{PADDING_LG}px; background:{colors['panel_subtle']};">
+            <div style="font-size:{FONT_LG}pt; font-weight:700; color:{colors['text_primary']}; margin-bottom:{PADDING_SM}px;">{title}</div>
             <div style="color:{colors['text_secondary']}; line-height:1.5;">{message}</div>
         </div>
         """
@@ -1783,15 +2013,158 @@ class CouncilWindow(QtWidgets.QMainWindow):
     def _refresh_header_badges(self):
         selected_count = sum(1 for cb in self.model_checks.values() if cb.isChecked())
         file_count = len(self.uploaded_files)
-        self.mode_badge.setText("Discussion" if self.mode == "discussion" else "Deliberation")
-        self.selection_badge.setText(
-            f"{selected_count} model{'s' if selected_count != 1 else ''} selected"
+        loaded_count = len(self.models)
+        ready = loaded_count > 0 and selected_count > 0
+        self.mode_badge.setText("mode: discussion" if self.mode == "discussion" else "mode: deliberation")
+        self._set_badge_tone(self.mode_badge, "neutral")
+        if ready:
+            self.connection_btn.setText("✓ Ready")
+            self._set_badge_tone(self.connection_btn, "success")
+        else:
+            self.connection_btn.setText("⚠ Setup required")
+            self._set_badge_tone(self.connection_btn, "warn")
+        self.selection_badge.setText(f"sel: {selected_count}")
+        self.attachment_badge.setText(f"files: {file_count}")
+        self.tool_badge.setText("web: on" if self.web_search_check.isChecked() else "web: off")
+        if hasattr(self, "step_connect"):
+            self._refresh_workflow_steps()
+        self._sync_run_ready_state()
+
+    def _set_run_button_state(self, state: RunState):
+        self.run_state = state
+        if isinstance(self.run_btn, StatefulRunButton):
+            self.run_btn.set_run_state(state.value)
+        else:
+            self.run_btn.setEnabled(state == RunState.READY)
+            self.run_btn.setText("Run council" if state in (RunState.LOCKED, RunState.READY) else "Running...")
+
+    def _sync_run_ready_state(self):
+        selected_count = sum(1 for cb in self.model_checks.values() if cb.isChecked())
+        if self.run_state in (RunState.RUNNING, RunState.STOPPING):
+            return
+        self._set_run_button_state(RunState.READY if selected_count > 0 else RunState.LOCKED)
+
+    def _set_right_panel_state(self, state: RightPanelState):
+        self.right_panel_state = state
+        index_map = {
+            RightPanelState.PRE_RUN: 0,
+            RightPanelState.IN_RUN: 1,
+            RightPanelState.POST_RUN: 2,
+        }
+        if hasattr(self, "right_panel_stack"):
+            self.right_panel_stack.setCurrentIndex(index_map[state])
+        tabs_enabled = state == RightPanelState.POST_RUN
+        if hasattr(self, "tabs"):
+            for idx in range(self.tabs.count()):
+                self.tabs.setTabEnabled(idx, tabs_enabled)
+            if tabs_enabled:
+                self.tabs.setCurrentIndex(0)
+
+    def _run_config_summary_html(self) -> str:
+        single_voter = self.single_voter_combo.currentText().strip() if self.single_voter_check.isChecked() else "All selected models vote"
+        return (
+            f"<div><strong>Mode:</strong> {escape_text(self.mode) if escape_text else self.mode}</div>"
+            f"<div><strong>Voting:</strong> {escape_text(single_voter) if escape_text else single_voter}</div>"
+            f"<div><strong>Concurrency:</strong> {int(self.conc_spin.value())}</div>"
+            f"<div><strong>Timeout:</strong> {int(self.timeout_seconds)} s</div>"
+            f"<div><strong>Web search:</strong> {'On' if self.web_search_check.isChecked() else 'Off'}</div>"
         )
-        self.attachment_badge.setText(
-            "No attachments" if file_count == 0 else f"{file_count} attachment{'s' if file_count != 1 else ''}"
-        )
-        web_text = "Web on" if self.web_search_check.isChecked() else "Web off"
-        self.tool_badge.setText(web_text)
+
+    def _update_run_config_used_view(self):
+        if hasattr(self, "run_config_used_view"):
+            self.run_config_used_view.setHtml(self._run_config_summary_html())
+
+    def _mark_results_stale(self, message: str = "New run will clear the currently displayed results."):
+        if not self.last_session_record:
+            return
+        self._results_stale = True
+        if self.right_panel_state == RightPanelState.POST_RUN:
+            self.pre_run_warning_label.setText(message)
+            self.pre_run_warning_label.show()
+            self._set_right_panel_state(RightPanelState.PRE_RUN)
+
+    def _refresh_workflow_steps(self):
+        if not hasattr(self, "step_connect"):
+            return
+        loaded_count = len(self.models)
+        selected_count = sum(1 for cb in self.model_checks.values() if cb.isChecked())
+        provider = self._current_provider_config()
+        provider_summary = f"{provider_label(provider.provider_type)} · {provider.base_url}"
+        self.step_connect.set_summary(provider_summary if loaded_count else "Choose a provider and load models.")
+        self.step_connect.set_state(WorkflowStepCard.COMPLETE if loaded_count else WorkflowStepCard.ACTIVE)
+        self.step_connect.set_collapsed(bool(loaded_count), animate=False)
+
+        if not loaded_count:
+            self.step_models.set_summary("Load models to unlock selection.")
+            self.step_models.set_state(WorkflowStepCard.LOCKED)
+            self.step_models.set_collapsed(False, animate=False)
+        else:
+            self.step_models.set_summary(
+                f"{selected_count} model{'s' if selected_count != 1 else ''} selected"
+                if selected_count else "Choose one or more models."
+            )
+            self.step_models.set_state(WorkflowStepCard.COMPLETE if selected_count else WorkflowStepCard.ACTIVE)
+            self.step_models.set_collapsed(bool(selected_count), animate=False)
+
+        self.step_history.set_state(WorkflowStepCard.IDLE)
+        self.step_history.set_collapsed(True, animate=False)
+
+    def _handle_workflow_step_clicked(self, step_number: int):
+        mapping = {
+            1: getattr(self, "step_connect", None),
+            2: getattr(self, "step_models", None),
+            3: getattr(self, "step_history", None),
+        }
+        target = mapping.get(step_number)
+        if not target:
+            return
+        for num, widget in mapping.items():
+            if widget is None or widget is target:
+                continue
+            if num != 3:
+                widget.set_collapsed(widget._state == WorkflowStepCard.COMPLETE, animate=False)
+
+    def _handle_workflow_step_completed(self, _step_number: int, _completed: bool):
+        self._sync_run_ready_state()
+
+    def _show_connection_menu(self):
+        menu = QtWidgets.QMenu(self)
+        provider = self._current_provider_config()
+        selected_count = sum(1 for cb in self.model_checks.values() if cb.isChecked())
+        loaded_count = len(self.models)
+        file_count = len(self.uploaded_files)
+        ready = loaded_count > 0 and selected_count > 0
+        menu.addSection("Ready summary" if ready else "Setup checklist")
+        if ready:
+            for line in (
+                f"Provider: {provider_label(provider.provider_type)}",
+                f"Endpoint: {provider.base_url}",
+                f"Models loaded: {loaded_count}",
+                f"Models selected: {selected_count}",
+                f"Attachments: {file_count}",
+                f"Web search: {'On' if self.web_search_check.isChecked() else 'Off'}",
+            ):
+                action = menu.addAction(line)
+                action.setEnabled(False)
+        else:
+            checklist = [
+                ("Load models", loaded_count > 0),
+                ("Select at least one model", selected_count > 0),
+            ]
+            for label, done in checklist:
+                action = menu.addAction(f"{'✓' if done else '○'} {label}")
+                action.setEnabled(False)
+        menu.addSeparator()
+        load_action = menu.addAction("Load models")
+        replace_action = menu.addAction("Replace model list")
+        settings_action = menu.addAction("Open settings panel")
+        selected = menu.exec(self.connection_btn.mapToGlobal(self.connection_btn.rect().bottomLeft()))
+        if selected == load_action:
+            self._connect_base()
+        elif selected == replace_action:
+            self._replace_models_clicked()
+        elif selected == settings_action:
+            self._open_settings_dialog()
 
     def _refresh_selection_summary(self):
         total_models = len(self.models)
@@ -1810,13 +2183,15 @@ class CouncilWindow(QtWidgets.QMainWindow):
         count = len(self.uploaded_files)
         if count == 0:
             self.attachment_help_label.setText(
-                "Upload supporting files or drag them into the attachment area before you send."
+                "Attach supporting files here before you run."
             )
         else:
             self.attachment_help_label.setText(
                 f"{count} attachment{'s' if count != 1 else ''} ready to include in the next run."
             )
+        self.files_list.setVisible(count > 0)
         self.remove_file_btn.setEnabled(count > 0)
+        self.clear_files_btn.setEnabled(count > 0)
         self._refresh_header_badges()
 
     def _set_context_status(self, text: str, tone: Optional[str] = None):
@@ -1851,16 +2226,79 @@ class CouncilWindow(QtWidgets.QMainWindow):
         esc = escape_text if escape_text else (lambda value: str(value))
         colors = self._surface_tokens()
         detail_html = f"""
-        <div style="font-size:20px; font-weight:700; margin-bottom:6px;">{esc(short_id(model_id))}</div>
-        <div style="margin-bottom:10px; color:{colors['text_secondary']};">{esc(provider_text)}</div>
-        <div style="margin-bottom:16px;"><strong>Score:</strong> {esc(str(score))}<br><strong>Persona:</strong> {esc(persona)}</div>
+        <div style="font-size:{FONT_XL}pt; font-weight:700; margin-bottom:{PADDING_SM}px;">{esc(short_id(model_id))}</div>
+        <div style="margin-bottom:{PADDING_MD}px; color:{colors['text_secondary']};">{esc(provider_text)}</div>
+        <div style="margin-bottom:{PADDING_LG}px;"><strong>Score:</strong> {esc(str(score))}<br><strong>Persona:</strong> {esc(persona)}</div>
         {self._safe_markdown_html(answer or "_No response returned._")}
         """
         self.selected_model_detail_view.setHtml(detail_html)
 
+    def _stream_winner_result(self, winner: str, answer: str, tally: Dict[str, Any], details: Dict[str, Any]):
+        if self._winner_stream_timer:
+            self._winner_stream_timer.stop()
+            self._winner_stream_timer.deleteLater()
+            self._winner_stream_timer = None
+
+        words = (answer or "").split()
+        if not words:
+            self.results_winner_view.setHtml(
+                result_presenter.build_winner_html(
+                    winner=winner,
+                    answer=answer,
+                    tally=tally,
+                    details=details,
+                    colors=self._surface_tokens(),
+                    short_id=short_id,
+                    safe_markdown_html=self._safe_markdown_html,
+                    escape_text=escape_text,
+                )
+            )
+            return
+
+        state = {"index": 0}
+        timer = QtCore.QTimer(self)
+        timer.setInterval(24 if not self.reduce_motion else 1)
+
+        def tick():
+            state["index"] = min(len(words), state["index"] + 12)
+            partial_answer = " ".join(words[: state["index"]])
+            if state["index"] < len(words):
+                partial_answer = f"{partial_answer} ▋"
+            self.results_winner_view.setHtml(
+                result_presenter.build_winner_html(
+                    winner=winner,
+                    answer=partial_answer,
+                    tally=tally,
+                    details=details,
+                    colors=self._surface_tokens(),
+                    short_id=short_id,
+                    safe_markdown_html=self._safe_markdown_html,
+                    escape_text=escape_text,
+                )
+            )
+            if state["index"] >= len(words):
+                timer.stop()
+                timer.deleteLater()
+                self._winner_stream_timer = None
+
+        timer.timeout.connect(tick)
+        self._winner_stream_timer = timer
+        tick()
+        timer.start()
+
     def _set_results_empty_state(self):
+        if self._winner_stream_timer:
+            self._winner_stream_timer.stop()
+            self._winner_stream_timer.deleteLater()
+            self._winner_stream_timer = None
+        self.last_session_record = None
+        self._results_stale = False
+        if hasattr(self, "pre_run_warning_label"):
+            self.pre_run_warning_label.hide()
         self.results_hint_label.setText("Run a council round to populate model outputs, scoring, and exports.")
         self._init_results_tabs()
+        for idx in range(self.tabs.count()):
+            self.tabs.setTabEnabled(idx, False)
         placeholder = self._placeholder_html(
             "No Results Yet",
             "Load models, select the ones you want to compare, then send a prompt to generate answers and voting details.",
@@ -1876,6 +2314,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
             self._placeholder_html("Discussion", "Collaborative discussion transcripts appear here in discussion mode.")
         )
         self.inline_log_view.clear()
+        if getattr(self, "debug_timeline_view", None):
+            self.debug_timeline_view.reset_timeline()
         self.selected_model_list.clear()
         self._current_answers.clear()
         self._current_tally.clear()
@@ -1883,13 +2323,27 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self._current_winner = ""
         self._current_question = ""
         self._refresh_selected_model_detail()
+        if hasattr(self, "in_run_live_view"):
+            self.in_run_live_view.clear()
+        self._update_run_config_used_view()
+        self._set_right_panel_state(RightPanelState.PRE_RUN)
+        self._sync_run_ready_state()
 
     def _setup_log_dock(self):
+        self.debug_timeline_view = DebugTimelineWidget() if DebugTimelineWidget else None
         self.log_view = QtWidgets.QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(self.log_history_limit)
+        if self.debug_timeline_view:
+            log_tabs = QtWidgets.QTabWidget()
+            log_tabs.setDocumentMode(True)
+            log_tabs.addTab(self.debug_timeline_view, "Timeline")
+            log_tabs.addTab(self.log_view, "Raw Log")
+            log_widget = log_tabs
+        else:
+            log_widget = self.log_view
         self.log_dock = QtWidgets.QDockWidget("Debug Log", self)
-        self.log_dock.setWidget(self.log_view)
+        self.log_dock.setWidget(log_widget)
         self.log_dock.setAllowedAreas(
             QtCore.Qt.BottomDockWidgetArea | QtCore.Qt.RightDockWidgetArea
         )
@@ -1904,6 +2358,9 @@ class CouncilWindow(QtWidgets.QMainWindow):
             self.settings_debug_check = panel.settings_debug_check
             self.settings_personas_check = panel.settings_personas_check
             self.settings_storage_label = panel.settings_storage_label
+            self.settings_timeout_spin = panel.settings_timeout_spin
+            self.settings_reduce_motion_check = panel.settings_reduce_motion_check
+            self.rubric_weight_spins = panel.rubric_weight_spins
             self.settings_shortcuts_btn = panel.settings_shortcuts_btn
             self.settings_issue_btn = panel.settings_issue_btn
             self.persona_search_edit = panel.persona_search_edit
@@ -1943,6 +2400,37 @@ class CouncilWindow(QtWidgets.QMainWindow):
             self.settings_storage_label = QtWidgets.QLabel("")
             self.settings_storage_label.setObjectName("HintLabel")
             self.settings_storage_label.setWordWrap(True)
+            timeout_row = QtWidgets.QWidget()
+            timeout_layout = QtWidgets.QHBoxLayout(timeout_row)
+            timeout_layout.setContentsMargins(0, 0, 0, 0)
+            timeout_layout.setSpacing(8)
+            timeout_layout.addWidget(QtWidgets.QLabel("Request timeout"))
+            timeout_layout.addStretch(1)
+            self.settings_timeout_spin = QtWidgets.QSpinBox()
+            self.settings_timeout_spin.setRange(15, 600)
+            self.settings_timeout_spin.setSuffix(" s")
+            timeout_layout.addWidget(self.settings_timeout_spin)
+            self.settings_reduce_motion_check = QtWidgets.QCheckBox("Reduce motion and skip non-essential animations")
+            self.rubric_weight_spins = {}
+            rubric_group = QtWidgets.QGroupBox("Scoring Rubric")
+            rubric_layout = QtWidgets.QGridLayout(rubric_group)
+            rubric_layout.setContentsMargins(10, 12, 10, 10)
+            rubric_layout.setHorizontalSpacing(10)
+            rubric_layout.setVerticalSpacing(8)
+            for row, (label_text, key) in enumerate(
+                [
+                    ("Correctness", "correctness"),
+                    ("Relevance", "relevance"),
+                    ("Specificity", "specificity"),
+                    ("Safety", "safety"),
+                    ("Conciseness", "conciseness"),
+                ]
+            ):
+                rubric_layout.addWidget(QtWidgets.QLabel(label_text), row, 0)
+                spin = QtWidgets.QSpinBox()
+                spin.setRange(0, 10)
+                rubric_layout.addWidget(spin, row, 1)
+                self.rubric_weight_spins[key] = spin
             self.settings_shortcuts_btn = QtWidgets.QPushButton("Keyboard Shortcuts")
             self.settings_shortcuts_btn.setObjectName("SecondaryButton")
             self.settings_issue_btn = QtWidgets.QPushButton("Report an Issue")
@@ -1951,6 +2439,9 @@ class CouncilWindow(QtWidgets.QMainWindow):
             settings_layout.addWidget(self.settings_debug_check)
             settings_layout.addWidget(self.settings_personas_check)
             settings_layout.addWidget(self.settings_storage_label)
+            settings_layout.addWidget(timeout_row)
+            settings_layout.addWidget(self.settings_reduce_motion_check)
+            settings_layout.addWidget(rubric_group)
             settings_layout.addWidget(self.settings_shortcuts_btn)
             settings_layout.addWidget(self.settings_issue_btn)
             settings_layout.addStretch(1)
@@ -1993,6 +2484,12 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
         self.settings_debug_check.toggled.connect(self._debug_toggled)
         self.settings_personas_check.toggled.connect(self._settings_personas_toggled)
+        self.settings_timeout_spin.valueChanged.connect(self._timeout_changed)
+        if hasattr(self, "run_timeout_spin"):
+            self.run_timeout_spin.valueChanged.connect(self._timeout_changed)
+        self.settings_reduce_motion_check.toggled.connect(self._reduce_motion_toggled)
+        for key, spin in getattr(self, "rubric_weight_spins", {}).items():
+            spin.valueChanged.connect(lambda value, rubric_key=key: self._rubric_weight_changed(rubric_key, value))
         self.settings_shortcuts_btn.clicked.connect(self._toggle_shortcut_overlay)
         self.settings_issue_btn.clicked.connect(
             lambda: QtGui.QDesktopServices.openUrl(QtCore.QUrl("https://github.com/TrentPierce/PolyCouncil/issues"))
@@ -2018,11 +2515,15 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.clear_btn.clicked.connect(self._clear_models)
         self.clear_model_list_btn.clicked.connect(self._clear_model_list)
         self.reset_btn.clicked.connect(self._reset_leaderboard_clicked)
-        self.send_btn.clicked.connect(self._send)
+        if isinstance(self.run_btn, StatefulRunButton):
+            self.run_btn.runRequested.connect(self._send)
+            self.run_btn.stopRequested.connect(self._stop_process)
+        else:
+            self.send_btn.clicked.connect(self._send)
         self.prompt_edit.submitRequested.connect(self._send)
-        self.stop_btn.clicked.connect(self._stop_process)
         self.conc_spin.valueChanged.connect(self._concurrency_changed)
         self.settings_btn.clicked.connect(self._open_settings_dialog)
+        self.connection_btn.clicked.connect(self._show_connection_menu)
         self.replay_last_btn.clicked.connect(self._replay_last_session)
         self.export_json_btn.clicked.connect(self._export_session_json)
         
@@ -2039,6 +2540,12 @@ class CouncilWindow(QtWidgets.QMainWindow):
         # single-voter signals (make sure message shows correct ON/OFF)
         self.single_voter_check.toggled.connect(self._single_voter_toggled_bool)
         self.single_voter_combo.currentTextChanged.connect(self._single_voter_changed)
+        if hasattr(self, "step_connect"):
+            self.step_connect.headerClicked.connect(self._handle_workflow_step_clicked)
+            self.step_models.headerClicked.connect(self._handle_workflow_step_clicked)
+            self.step_history.headerClicked.connect(self._handle_workflow_step_clicked)
+            self.step_connect.stepCompleted.connect(self._handle_workflow_step_completed)
+            self.step_models.stepCompleted.connect(self._handle_workflow_step_completed)
 
         self.status_signal.connect(self._set_status)
         self.result_signal.connect(self._handle_result)
@@ -2049,6 +2556,30 @@ class CouncilWindow(QtWidgets.QMainWindow):
         
         # Keyboard shortcuts
         self._setup_keyboard_shortcuts()
+
+    def _configure_tab_order(self):
+        tab_sequence = [
+            self.provider_combo,
+            self.api_service_combo,
+            self.base_edit,
+            self.api_key_inline,
+            self.show_key_check,
+            self.connect_btn,
+            self.replace_models_btn,
+            self.add_provider_btn,
+            self.model_filter_edit,
+            self.refresh_models_btn,
+            self.select_all_btn,
+            self.clear_btn,
+            self.upload_btn,
+            self.remove_file_btn,
+            self.clear_files_btn,
+            self.prompt_edit,
+            self.run_btn,
+            self.settings_btn,
+        ]
+        for current, nxt in zip(tab_sequence, tab_sequence[1:]):
+            QtWidgets.QWidget.setTabOrder(current, nxt)
     
     def _setup_keyboard_shortcuts(self):
         """Setup keyboard shortcuts for common actions."""
@@ -2079,6 +2610,9 @@ class CouncilWindow(QtWidgets.QMainWindow):
             help_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Ctrl+/"), self)
             help_shortcut.activated.connect(self._toggle_shortcut_overlay)
 
+        theme_shortcut = QtGui.QShortcut(QtGui.QKeySequence(ACTIONS["toggle_theme"]["shortcut"]), self)
+        theme_shortcut.activated.connect(self._toggle_theme)
+
     # --- New UI helpers ---
 
     def _show_onboarding(self):
@@ -2101,6 +2635,16 @@ class CouncilWindow(QtWidgets.QMainWindow):
         if self._shortcut_overlay:
             self._shortcut_overlay.toggle()
 
+    def _toggle_theme(self):
+        if self._theme_engine is None:
+            return
+        from ui.theme import toggle_theme
+
+        toggle_theme(self, self._theme_engine)
+        save_settings({"theme_mode": "dark" if self._theme_engine.is_dark else "light"})
+        self._refresh_output_document_styles()
+        self._set_status(f"Theme set to {'dark' if self._theme_engine.is_dark else 'light'} mode.")
+
     def _show_toast(self, message: str, tone: str = "info", duration_ms: int = 3500):
         """Show a non-blocking toast notification over the main window."""
         if not _UI_AVAILABLE:
@@ -2115,15 +2659,57 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self._refresh_settings_panel()
         self._refresh_header_badges()
 
+    def _timeout_changed(self, value: int):
+        self.timeout_seconds = int(value)
+        if hasattr(self, "settings_timeout_spin") and self.settings_timeout_spin.value() != self.timeout_seconds:
+            self.settings_timeout_spin.blockSignals(True)
+            self.settings_timeout_spin.setValue(self.timeout_seconds)
+            self.settings_timeout_spin.blockSignals(False)
+        if hasattr(self, "run_timeout_spin") and self.run_timeout_spin.value() != self.timeout_seconds:
+            self.run_timeout_spin.blockSignals(True)
+            self.run_timeout_spin.setValue(self.timeout_seconds)
+            self.run_timeout_spin.blockSignals(False)
+        save_settings({"timeout_seconds": self.timeout_seconds})
+        self._mark_results_stale()
+        self._update_run_config_used_view()
+        self._set_status(f"Request timeout set to {self.timeout_seconds} seconds.")
+
+    def _reduce_motion_toggled(self, checked: bool):
+        self.reduce_motion = bool(checked)
+        if set_reduce_motion:
+            set_reduce_motion(self.reduce_motion)
+        save_settings({"reduce_motion": self.reduce_motion})
+        self._set_status("Reduced motion enabled." if self.reduce_motion else "Reduced motion disabled.")
+
+    def _rubric_weight_changed(self, key: str, value: int):
+        self.rubric_weights[key] = max(0, int(value))
+        self.rubric_weights = normalize_rubric_weights(self.rubric_weights)
+        save_settings({"rubric_weights": self.rubric_weights})
+        self._set_status(f"Updated rubric weight for {key}.")
+
     def _refresh_settings_panel(self):
         if not hasattr(self, "settings_debug_check"):
             return
         self.settings_debug_check.blockSignals(True)
         self.settings_personas_check.blockSignals(True)
+        self.settings_timeout_spin.blockSignals(True)
+        self.settings_reduce_motion_check.blockSignals(True)
         self.settings_debug_check.setChecked(self.debug_enabled)
         self.settings_personas_check.setChecked(self.use_roles)
+        self.settings_timeout_spin.setValue(int(self.timeout_seconds))
+        if hasattr(self, "run_timeout_spin"):
+            self.run_timeout_spin.blockSignals(True)
+            self.run_timeout_spin.setValue(int(self.timeout_seconds))
+            self.run_timeout_spin.blockSignals(False)
+        self.settings_reduce_motion_check.setChecked(bool(self.reduce_motion))
+        for key, spin in getattr(self, "rubric_weight_spins", {}).items():
+            spin.blockSignals(True)
+            spin.setValue(int(self.rubric_weights.get(key, 0)))
+            spin.blockSignals(False)
         self.settings_debug_check.blockSignals(False)
         self.settings_personas_check.blockSignals(False)
+        self.settings_timeout_spin.blockSignals(False)
+        self.settings_reduce_motion_check.blockSignals(False)
         if getattr(self, "secure_keyring_available", False):
             self.settings_storage_label.setText("Secure storage is available for hosted API keys on this machine.")
         else:
@@ -2152,7 +2738,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
                     continue
                 item = QtWidgets.QListWidgetItem(name)
                 if persona.get("builtin", False):
-                    item.setForeground(QtGui.QColor("#666"))
+                    item.setForeground(self.palette().color(QtGui.QPalette.Mid))
                 self.persona_library_list.addItem(item)
             if current_name:
                 matches = self.persona_library_list.findItems(current_name, QtCore.Qt.MatchExactly)
@@ -2179,8 +2765,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
         assignment_count = sum(1 for assigned in self.persona_assignments.values() if assigned == persona["name"])
         colors = self._surface_tokens()
         self.persona_preview.setHtml(
-            f"<div style='font-size:18px; font-weight:700; margin-bottom:6px;'>{escape_text(persona['name']) if escape_text else persona['name']}</div>"
-            f"<div style='margin-bottom:10px; color:{colors['text_secondary']};'>"
+            f"<div style='font-size:{FONT_LG}pt; font-weight:700; margin-bottom:{PADDING_SM}px;'>{escape_text(persona['name']) if escape_text else persona['name']}</div>"
+            f"<div style='margin-bottom:{PADDING_MD}px; color:{colors['text_secondary']};'>"
             f"{'Built-in' if persona.get('builtin', False) else 'Custom'} persona · Assigned to {assignment_count} model(s)</div>"
             f"{self._safe_markdown_html(prompt)}"
         )
@@ -2188,10 +2774,13 @@ class CouncilWindow(QtWidgets.QMainWindow):
     def _prompt_for_persona_text(self, title: str, current_prompt: str = "") -> Optional[str]:
         prompt_dialog = QtWidgets.QDialog(self)
         prompt_dialog.setWindowTitle(title)
-        prompt_dialog.resize(560, 360)
+        prompt_dialog.resize(dp(560), dp(360))
+        prompt_dialog.setMinimumSize(dp(480), dp(320))
+        prompt_dialog.setModal(True)
+        prompt_dialog.setWindowModality(QtCore.Qt.ApplicationModal)
         layout = QtWidgets.QVBoxLayout(prompt_dialog)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
+        layout.setContentsMargins(dp(PADDING_LG), dp(PADDING_LG), dp(PADDING_LG), dp(PADDING_LG))
+        layout.setSpacing(dp(INTERNAL_GAP))
         layout.addWidget(QtWidgets.QLabel("System prompt"))
         text_edit = QtWidgets.QPlainTextEdit()
         text_edit.setPlainText(current_prompt)
@@ -2219,8 +2808,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
         try:
             if add_user_persona:
                 add_user_persona(name, prompt if prompt else None)
-        except Exception as e:
-            print(f"Error saving user persona: {e}")
+        except Exception:
+            LOGGER.exception("Error saving user persona")
         self._sort_personas_inplace()
         self._save_persona_state()
         self._refresh_persona_combos()
@@ -2253,8 +2842,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
         try:
             if update_user_persona:
                 update_user_persona(name, new_name, prompt if prompt else None)
-        except Exception as e:
-            print(f"Error updating user persona: {e}")
+        except Exception:
+            LOGGER.exception("Error updating user persona")
         if name != new_name:
             self.persona_assignments = (
                 rename_persona_assignments(self.persona_assignments, name, new_name)
@@ -2286,8 +2875,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
         try:
             if delete_user_persona:
                 delete_user_persona(name)
-        except Exception as e:
-            print(f"Error deleting user persona: {e}")
+        except Exception:
+            LOGGER.exception("Error deleting user persona")
         self.persona_assignments = (
             clear_persona_assignment(self.persona_assignments, name)
             if clear_persona_assignment
@@ -2556,10 +3145,6 @@ class CouncilWindow(QtWidgets.QMainWindow):
                     continue
                 btn.setVisible(enabled)
                 btn.setEnabled(enabled)
-                if enabled:
-                    btn.setStyleSheet("")
-                else:
-                    btn.setStyleSheet("QPushButton { color: #888; background-color: #333; }")
         # Force layout update
         if hasattr(self, 'models_inner') and self.models_inner:
             self.models_inner.updateGeometry()
@@ -2713,8 +3298,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
             prompt = persona.get("prompt") or "No prompt configured."
             assigned_count = sum(1 for assigned in self.persona_assignments.values() if assigned == persona["name"])
             html = (
-                f"<div style='font-size:18px; font-weight:700; margin-bottom:6px;'>{escape_text(persona['name']) if escape_text else persona['name']}</div>"
-                f"<div style='margin-bottom:10px; color:{colors['text_secondary']};'>"
+                f"<div style='font-size:{FONT_LG}pt; font-weight:700; margin-bottom:{PADDING_SM}px;'>{escape_text(persona['name']) if escape_text else persona['name']}</div>"
+                f"<div style='margin-bottom:{PADDING_MD}px; color:{colors['text_secondary']};'>"
                 f"{'Built-in' if persona.get('builtin', False) else 'Custom'} persona &middot; Assigned to {assigned_count} model(s)</div>"
                 f"{self._safe_markdown_html(prompt)}"
             )
@@ -2722,6 +3307,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
     def _concurrency_changed(self, value: int):
         save_settings({"max_concurrency": int(value)})
+        self._mark_results_stale()
+        self._update_run_config_used_view()
         self._refresh_header_badges()
 
     def _open_settings_dialog(self):
@@ -2750,10 +3337,14 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
     def _single_voter_toggled_bool(self, checked: bool):
         save_settings({"single_voter_enabled": bool(checked), "single_voter_model": self.single_voter_combo.currentText()})
+        self._mark_results_stale()
+        self._update_run_config_used_view()
         self._set_status("Single-voter mode: ON" if checked else "Single-voter mode: OFF")
 
     def _single_voter_changed(self, text: str):
         save_settings({"single_voter_model": text})
+        self._mark_results_stale()
+        self._update_run_config_used_view()
 
     def _connect_base(self):
         provider = self._current_provider_config()
@@ -2803,7 +3394,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
             self._fetch_append = bool(append)
             self._fetch_provider = provider
 
-            self._model_worker = ModelFetchWorker(provider)
+            self._model_worker = ModelFetchWorker(provider, timeout_seconds=self.timeout_seconds)
             self._model_thread = QtCore.QThread(self)
             self._model_worker.moveToThread(self._model_thread)
 
@@ -2961,11 +3552,9 @@ class CouncilWindow(QtWidgets.QMainWindow):
                 has_visual = any("vl" in model.lower() for model in self.models)
         
         if has_visual:
-            self.visual_status.setText("Visual/Image Support: ✓ Detected")
-            self.visual_status.setStyleSheet("color: green;")
+            self.upload_btn.setToolTip("Attach documents or images. Visual-capable models are available.")
         else:
-            self.visual_status.setText("Visual/Image Support: Not detected")
-            self.visual_status.setStyleSheet("")
+            self.upload_btn.setToolTip("Attach documents. Image attachments require a visual-capable model.")
         
         # Check if any SELECTED model supports web search
         has_web_search = False
@@ -3101,24 +3690,76 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
     def _reset_leaderboard_clicked(self):
         try:
-            if DB_PATH.exists():
-                DB_PATH.unlink()
-            ensure_db()
+            if leaderboard_store:
+                leaderboard_store.reset_leaderboard()
+            else:
+                if DB_PATH.exists():
+                    DB_PATH.unlink()
+                ensure_db()
             self._refresh_leaderboard()
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Reset Leaderboard", str(e))
 
     def _refresh_leaderboard(self):
         self.leader_list.clear()
-        leaderboard = load_leaderboard()
+        leaderboard = leaderboard_store.load_leaderboard() if leaderboard_store else load_leaderboard()
         total_wins = sum(count for _, count in leaderboard)
         for mid, count in leaderboard:
             pct = (count / total_wins * 100) if total_wins > 0 else 0
-            self.leader_list.addItem(f"{short_id(mid)} — {count} wins ({pct:.0f}%)")
+            item = QtWidgets.QListWidgetItem(self.leader_list)
+            item.setFlags(QtCore.Qt.ItemIsEnabled)
+            row = QtWidgets.QWidget()
+            row.setObjectName("LeaderboardItem")
+            row_layout = QtWidgets.QVBoxLayout(row)
+            row_layout.setContentsMargins(10, 8, 10, 8)
+            row_layout.setSpacing(6)
+
+            top = QtWidgets.QHBoxLayout()
+            top.setContentsMargins(0, 0, 0, 0)
+            top.setSpacing(8)
+            name_label = QtWidgets.QLabel(short_id(mid))
+            name_label.setObjectName("FieldLabel")
+            wins_label = QtWidgets.QLabel(f"{count} win{'s' if count != 1 else ''}")
+            wins_label.setObjectName("HintLabel")
+            top.addWidget(name_label)
+            top.addStretch(1)
+            top.addWidget(wins_label)
+
+            bar = QtWidgets.QProgressBar()
+            bar.setObjectName("WinRateBar")
+            bar.setRange(0, 100)
+            bar.setValue(int(round(pct)))
+            bar.setTextVisible(False)
+            bar.setFixedHeight(8)
+
+            bottom = QtWidgets.QHBoxLayout()
+            bottom.setContentsMargins(0, 0, 0, 0)
+            bottom.setSpacing(8)
+            share_label = QtWidgets.QLabel("share of recorded wins")
+            share_label.setObjectName("HintLabel")
+            pct_label = QtWidgets.QLabel(f"{pct:.0f}%")
+            pct_label.setObjectName("FieldLabel")
+            bottom.addWidget(share_label)
+            bottom.addStretch(1)
+            bottom.addWidget(pct_label)
+
+            row_layout.addLayout(top)
+            row_layout.addWidget(bar)
+            row_layout.addLayout(bottom)
+            item.setSizeHint(row.sizeHint())
+            self.leader_list.setItemWidget(item, row)
         if leaderboard:
             self.lb_title.setText(f"Council performance over time · {len(leaderboard)} tracked model(s)")
         else:
             self.lb_title.setText("Council performance over time · no votes recorded yet")
+            item = QtWidgets.QListWidgetItem(self.leader_list)
+            item.setFlags(QtCore.Qt.ItemIsEnabled)
+            placeholder = QtWidgets.QLabel("No wins recorded yet. Run a deliberation round to start tracking model performance.")
+            placeholder.setObjectName("HintLabel")
+            placeholder.setWordWrap(True)
+            placeholder.setContentsMargins(10, 8, 10, 8)
+            item.setSizeHint(placeholder.sizeHint())
+            self.leader_list.setItemWidget(item, placeholder)
 
     def _filter_model_rows(self):
         query = self.model_filter_edit.text().strip().lower()
@@ -3173,12 +3814,12 @@ class CouncilWindow(QtWidgets.QMainWindow):
         border_color = colors["border"]
         base_color = colors["panel_subtle"]
         alt_color = colors["panel_alt"]
-        user_bg = "#1f4f82" if is_dark else "#e8f2ff"
-        user_fg = "#f7fbff" if is_dark else text_color
+        user_bg = THEME["accent"] if is_dark else THEME["bg_tertiary"]
+        user_fg = THEME["accent_fg"] if is_dark else text_color
         council_bg = colors["panel"]
         note_bg = "transparent"
         error_bg = colors["danger_bg"]
-        style = "margin: 6px 0; padding: 10px 12px; border-radius: 12px;"
+        style = f"margin: {PADDING_SM}px 0; padding: {PADDING_MD}px {PADDING_LG}px; border-radius: {PADDING_MD}px;"
         header = ""
 
         if text.startswith("You:"):
@@ -3215,6 +3856,9 @@ class CouncilWindow(QtWidgets.QMainWindow):
         full_html = f"<div style='{style}'>{body_html}</div>"
         self.chat_view.append(full_html)
         self.chat_view.verticalScrollBar().setValue(self.chat_view.verticalScrollBar().maximum())
+        if hasattr(self, "in_run_live_view"):
+            self.in_run_live_view.append(full_html)
+            self.in_run_live_view.verticalScrollBar().setValue(self.in_run_live_view.verticalScrollBar().maximum())
 
     def _append_log(self, text: str):
         if not text:
@@ -3224,6 +3868,12 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.log_view.appendPlainText(text)
         if hasattr(self, "inline_log_view") and self.inline_log_view:
             self.inline_log_view.appendPlainText(text)
+        if hasattr(self, "in_run_progress_label"):
+            self.in_run_progress_label.setText(text)
+        if hasattr(self, "in_run_live_view"):
+            self.in_run_live_view.append(f"<div>{escape_text(text) if escape_text else text}</div>")
+        if getattr(self, "debug_timeline_view", None):
+            self.debug_timeline_view.add_status(text)
         self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
 
     def _log_sink_dispatch(self, label: str, message: str):
@@ -3234,6 +3884,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.log_signal.emit(formatted)
 
     def _set_status(self, text: str):
+        if getattr(self, "debug_timeline_view", None):
+            self.debug_timeline_view.add_status(text)
         if self._animated_status:
             self._animated_status.set_status(text)
             self._status_tone = self._animated_status.badge.property("tone") or "neutral"
@@ -3269,10 +3921,6 @@ class CouncilWindow(QtWidgets.QMainWindow):
         else:
             self.busy.setVisible(on)
             self.busy.setMaximum(0 if on else 1)
-        if hasattr(self, 'stop_btn'):
-            self.stop_btn.setEnabled(on)
-        if hasattr(self, 'send_btn'):
-            self.send_btn.setEnabled(not on)
         for attr in (
             "connect_btn",
             "replace_models_btn",
@@ -3297,37 +3945,40 @@ class CouncilWindow(QtWidgets.QMainWindow):
             self.status_badge.setText("Working")
             self._set_badge_tone(self.status_badge, "busy")
             self._set_context_status("Running council…", "busy")
+            self._set_right_panel_state(RightPanelState.IN_RUN)
         else:
             self._refresh_attachment_summary()
             self._set_status(self.status_label.text())
+            if self.right_panel_state == RightPanelState.IN_RUN:
+                self._set_right_panel_state(RightPanelState.PRE_RUN if not self.last_session_record else RightPanelState.POST_RUN)
 
     def _mode_changed(self, index: int):
         """Handle mode selection change."""
         self.mode = "discussion" if index == 1 else "deliberation"
+        self._mark_results_stale()
         # Update UI based on mode
         if self.mode == "discussion":
-            self.tabs_title.setText("Discussion View")
+            self.tabs_title.setText("Discussion report")
             # Hide single voter controls in discussion mode
             self.single_voter_check.setVisible(False)
             self.single_voter_combo.setVisible(False)
-            self.leaderboard_group.setVisible(False)
             self.mode_help_label.setText(
-                "Collaborative discussion runs multiple turns and produces a synthesized report instead of a weighted vote."
+                "Discussion mode runs multiple turns and produces a synthesized report instead of weighted ballots."
             )
             self.prompt_edit.setPlaceholderText(
                 "Start a collaborative discussion. Press Enter to send, Shift+Enter for a new line."
             )
         else:
-            self.tabs_title.setText("Per-Model Answers")
+            self.tabs_title.setText("Council results")
             self.single_voter_check.setVisible(True)
             self.single_voter_combo.setVisible(True)
-            self.leaderboard_group.setVisible(True)
             self.mode_help_label.setText(
-                "Weighted deliberation compares model answers, scores them against the rubric, and picks a winner."
+                "Weighted deliberation compares answers, scores them against the rubric, and picks a winner."
             )
             self.prompt_edit.setPlaceholderText(
                 "Ask the council a question. Press Enter to send, Shift+Enter for a new line."
             )
+        self._update_run_config_used_view()
         self._refresh_header_badges()
     
     def _current_has_visual_support(self) -> bool:
@@ -3464,11 +4115,15 @@ class CouncilWindow(QtWidgets.QMainWindow):
     def _web_search_toggled(self, checked: bool):
         """Handle web search toggle."""
         self.web_search_enabled = checked
+        self._mark_results_stale()
+        self._update_run_config_used_view()
         self._refresh_header_badges()
     
     def _stop_process(self):
         """Handle stop button click."""
         self._stop_requested = True
+        self._set_run_button_state(RunState.STOPPING)
+        self.in_run_progress_label.setText("Stopping the current run…")
         self._set_status("Stopping...")
         self._busy(False)
         self._append_chat("[Stopped] Process cancelled by user.")
@@ -3569,10 +4224,15 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
         # Prepare UI
         self._prepare_tabs(selected)
+        if getattr(self, "debug_timeline_view", None):
+            self.debug_timeline_view.reset_timeline()
         self._append_chat(f"You: {question}")
         if images:
             self._append_chat(f"<i>[Attached {len(images)} image(s)]</i>")
         self.prompt_edit.clear()
+        self._results_stale = False
+        self.pre_run_warning_label.hide()
+        self._set_run_button_state(RunState.RUNNING)
         self._set_status("Starting council …")
 
         conc =  int(self.conc_spin.value())
@@ -3605,13 +4265,17 @@ class CouncilWindow(QtWidgets.QMainWindow):
                         max_concurrency=conc, voter_override=voters,
                         images=images, web_search=web_search,
                         rubric_weights=self.rubric_weights,
+                        timeout_seconds=self.timeout_seconds,
                         is_cancelled=lambda: self._stop_requested
                     )
                 )
                 if not self._stop_requested:
                     # record leaderboard
                     try:
-                        record_vote(question, winner, details)
+                        if leaderboard_store:
+                            leaderboard_store.record_vote(question, winner, details, debug_hook=_dbg)
+                        else:
+                            record_vote(question, winner, details)
                     except Exception:
                         pass
                     self.result_signal.emit((question, answers, winner, details, tally))
@@ -3659,10 +4323,15 @@ class CouncilWindow(QtWidgets.QMainWindow):
         
         # Prepare UI for discussion mode
         self._prepare_discussion_tabs(selected)
+        if getattr(self, "debug_timeline_view", None):
+            self.debug_timeline_view.reset_timeline()
         self._append_chat(f"You: {question}")
         if images:
             self._append_chat(f"<i>[Attached {len(images)} image(s)]</i>")
         self.prompt_edit.clear()
+        self._results_stale = False
+        self.pre_run_warning_label.hide()
+        self._set_run_button_state(RunState.RUNNING)
         self._set_status("Starting collaborative discussion…")
 
         conc = int(self.conc_spin.value())
@@ -3686,6 +4355,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
                     update_callback=lambda entry: self.discussion_update_signal.emit(entry),
                     max_turns=10,
                     max_concurrency=conc,
+                    timeout_seconds=self.timeout_seconds,
                     is_cancelled=lambda: self._stop_requested
                 )
                 transcript, synthesis = asyncio.run(manager.run_discussion())
@@ -3803,12 +4473,16 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
     def _handle_error(self, msg: str):
         self._busy(False)
+        self._set_run_button_state(RunState.READY if any(cb.isChecked() for cb in self.model_checks.values()) else RunState.LOCKED)
         self.results_hint_label.setText("The last run failed. Review the status message and debug log for details.")
+        if getattr(self, "debug_timeline_view", None):
+            self.debug_timeline_view.add_error(msg)
         self._set_status(f"Error: {msg}")
         self._append_chat(f"[Error] {msg}")
 
     def _handle_result(self, payload: object):
         self._busy(False)
+        self._set_run_button_state(RunState.READY if any(cb.isChecked() for cb in self.model_checks.values()) else RunState.LOCKED)
         
         # Check if this is a discussion mode result
         if isinstance(payload, tuple) and len(payload) > 0 and payload[0] == "discussion":
@@ -3843,18 +4517,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
                 normalize_rubric_weights=normalize_rubric_weights,
             )
         )
-        self.results_winner_view.setHtml(
-            result_presenter.build_winner_html(
-                winner=winner,
-                answer=answers.get(winner, ""),
-                tally=tally,
-                details=details,
-                colors=self._surface_tokens(),
-                short_id=short_id,
-                safe_markdown_html=self._safe_markdown_html,
-                escape_text=escape_text,
-            )
-        )
+        self._stream_winner_result(winner, answers.get(winner, ""), tally, details)
         self.results_ballots_view.setHtml(
             result_presenter.build_ballots_html(
                 answers=answers,
@@ -3892,7 +4555,11 @@ class CouncilWindow(QtWidgets.QMainWindow):
         for model, label in self.model_meta_labels.items():
             label.setText(self._model_badge_text(model))
         self.results_hint_label.setText("Latest council result loaded.")
+        self._update_run_config_used_view()
+        self._set_right_panel_state(RightPanelState.POST_RUN)
         self.tabs.setCurrentWidget(self.results_overview_view)
+        if getattr(self, "debug_timeline_view", None):
+            self.debug_timeline_view.show_deliberation_result(details=details, tally=tally, short_id=short_id)
         if save_session:
             try:
                 session_path = save_session(self.last_session_record)
@@ -3935,6 +4602,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
                 escape_text=escape_text,
             )
         )
+        if getattr(self, "debug_timeline_view", None):
+            self.debug_timeline_view.show_discussion_result(transcript=transcript, synthesis=synthesis)
         self.selected_model_list.clear()
         self._refresh_selected_model_detail()
         
@@ -3953,6 +4622,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
             "timings_ms": {},
         }
         self.results_hint_label.setText("Latest discussion result loaded.")
+        self._update_run_config_used_view()
+        self._set_right_panel_state(RightPanelState.POST_RUN)
         self.tabs.setCurrentWidget(self.results_overview_view)
         if save_session:
             try:
@@ -4015,6 +4686,25 @@ class CouncilWindow(QtWidgets.QMainWindow):
         except Exception as exc:
             QtWidgets.QMessageBox.critical(self, "Export Error", f"Failed to export session JSON: {exc}")
 
+    def _restore_window_state(self, settings: Dict[str, Any]) -> None:
+        geometry = settings.get("window_geometry", "") or ""
+        state = settings.get("window_state", "") or ""
+        if geometry:
+            try:
+                self.restoreGeometry(QtCore.QByteArray.fromBase64(geometry.encode("ascii")))
+            except Exception:
+                LOGGER.exception("Failed to restore window geometry")
+        if state:
+            try:
+                self.restoreState(QtCore.QByteArray.fromBase64(state.encode("ascii")))
+            except Exception:
+                LOGGER.exception("Failed to restore window state")
+        available = self.screen().availableGeometry() if self.screen() else QtCore.QRect(0, 0, dp(MIN_W), dp(MIN_H))
+        current = self.frameGeometry()
+        if not available.intersects(current):
+            self.resize(max(self.width(), dp(MIN_W)), max(self.height(), dp(MIN_H)))
+            self.move(available.topLeft() + QtCore.QPoint(dp(PADDING_LG), dp(PADDING_LG)))
+
     def closeEvent(self, event: QtGui.QCloseEvent):
         try:
             provider = self._current_provider_config()
@@ -4030,6 +4720,11 @@ class CouncilWindow(QtWidgets.QMainWindow):
                 "max_concurrency": int(self.conc_spin.value()),
                 "roles_enabled": bool(self.use_roles),
                 "rubric_weights": self.rubric_weights,
+                "timeout_seconds": int(self.timeout_seconds),
+                "reduce_motion": bool(self.reduce_motion),
+                "theme_mode": "dark" if getattr(self, "_theme_engine", None) and self._theme_engine.is_dark else "light",
+                "window_geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
+                "window_state": bytes(self.saveState().toBase64()).decode("ascii"),
             })
         except Exception:
             pass
@@ -4042,7 +4737,9 @@ def main():
     import sys
     import platform
     sys.excepthook = log_unhandled_exception
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     app = QtWidgets.QApplication(sys.argv)
+    refresh_dpi_scale(app)
     app.setApplicationName("PolyCouncil")
     app.setApplicationDisplayName("PolyCouncil")
     
@@ -4060,10 +4757,20 @@ def main():
         except Exception:
             pass
     
-    w = CouncilWindow()
-    w.setWindowIcon(icon)
-    w.show()
-    sys.exit(app.exec())
+    if qasync:
+        loop = qasync.QEventLoop(app)
+        asyncio.set_event_loop(loop)
+        app.aboutToQuit.connect(loop.stop)
+        with loop:
+            w = CouncilWindow()
+            w.setWindowIcon(icon)
+            w.show()
+            loop.run_forever()
+    else:
+        w = CouncilWindow()
+        w.setWindowIcon(icon)
+        w.show()
+        sys.exit(app.exec())
 
 if __name__ == "__main__":
     main()

@@ -5,6 +5,7 @@ Manages turn-based conversational workflow between agents.
 
 import asyncio
 import json
+import logging
 import re
 from typing import Dict, List, Optional, Tuple, Callable
 from pathlib import Path
@@ -18,6 +19,8 @@ PROVIDER_OLLAMA = "ollama"
 
 # Core system instruction for Collaborative Discussion Mode
 CORE_SYSTEM_INSTRUCTION = """You are participating in a Collaborative Discussion to fully examine the user's request. Speak in character based on your assigned persona. Your message must be brief, constructive, and move the discussion forward. The discussion is ongoing until a comprehensive, multi-sided consensus or ruling is reached."""
+
+LOGGER = logging.getLogger(__name__)
 
 
 class DiscussionManager:
@@ -39,6 +42,7 @@ class DiscussionManager:
         update_callback: Optional[Callable[[Dict], None]] = None,
         max_turns: int = 10,
         max_concurrency: int = 1,
+        timeout_seconds: int = 120,
         is_cancelled: Optional[Callable[[], bool]] = None
     ):
         """
@@ -74,6 +78,7 @@ class DiscussionManager:
         self.update_callback = update_callback
         self.max_turns = max_turns
         self.max_concurrency = max_concurrency
+        self.timeout_seconds = max(15, int(timeout_seconds))
         self.is_cancelled = is_cancelled
         
         self.transcript: List[Dict[str, str]] = []
@@ -185,8 +190,8 @@ class DiscussionManager:
                     for persona in personas:
                         if persona.get("id") == persona_id:
                             return persona.get("prompt_instruction", "")
-        except Exception as e:
-            print(f"Error loading default persona {persona_id}: {e}")
+        except Exception:
+            LOGGER.exception("Error loading default persona %s", persona_id)
         return ""
     
     def _load_user_persona(self, persona_id: str) -> str:
@@ -199,8 +204,8 @@ class DiscussionManager:
                     for persona in personas:
                         if persona.get("id") == persona_id:
                             return persona.get("prompt_instruction", "")
-        except Exception as e:
-            print(f"Error loading user persona {persona_id}: {e}")
+        except Exception:
+            LOGGER.exception("Error loading user persona %s", persona_id)
         return ""
     
     def _assemble_prompt(self, agent: Dict, conversation_history: List[Dict]) -> str:
@@ -360,7 +365,7 @@ class DiscussionManager:
             provider_type, _, _, _ = self._agent_provider(agent)
             url = self._chat_url(agent)
             headers = self._headers(agent)
-            timeout = aiohttp.ClientTimeout(total=120)
+            timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
             if provider_type == PROVIDER_OLLAMA:
                 payload = {
                     "model": model,
@@ -406,8 +411,8 @@ class DiscussionManager:
                     content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 return content
                 
-        except Exception as e:
-            print(f"Error calling agent {agent.get('name', model)}: {e}")
+        except Exception:
+            LOGGER.exception("Error calling agent %s", agent.get("name", model))
             return None
     
     def _estimate_tokens(self, text: str) -> int:
@@ -569,7 +574,7 @@ Summary:"""
                 }
             payload = self._apply_temperature(payload, provider_type, None)
             
-            timeout = aiohttp.ClientTimeout(total=60)
+            timeout = aiohttp.ClientTimeout(total=max(15, min(self.timeout_seconds, 60)))
             async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
                 if resp.status != 200:
                     return ""
@@ -581,8 +586,8 @@ Summary:"""
                     content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 return content.strip()
                 
-        except Exception as e:
-            print(f"Error generating conversation summary: {e}")
+        except Exception:
+            LOGGER.exception("Error generating conversation summary")
             return ""
     
     async def run_discussion(self) -> Tuple[List[Dict], Optional[str]]:
@@ -804,13 +809,13 @@ Synthesis:"""
                 }
             payload = self._apply_temperature(payload, provider_type, None)
             
-            timeout = aiohttp.ClientTimeout(total=180)  # Longer timeout for synthesis
+            timeout = aiohttp.ClientTimeout(total=max(self.timeout_seconds, 180))
             async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
                     if self.status_callback:
                         self.status_callback(f"Synthesis generation failed: HTTP {resp.status}")
-                    print(f"Synthesis generation error: HTTP {resp.status} - {error_text[:500]}")
+                    LOGGER.error("Synthesis generation error: HTTP %s - %s", resp.status, error_text[:500])
                     return None
                 
                 data = await resp.json()
@@ -838,18 +843,16 @@ Synthesis:"""
                 else:
                     if self.status_callback:
                         self.status_callback("Synthesis response was empty")
-                    print(f"Synthesis response had no content. Full response: {data}")
+                    LOGGER.warning("Synthesis response had no content. Full response: %s", data)
                     return None
                 
         except asyncio.TimeoutError:
             if self.status_callback:
                 self.status_callback("Synthesis generation timed out")
-            print("Error generating synthesis: Timeout")
+            LOGGER.error("Error generating synthesis: Timeout")
             return None
         except Exception as e:
             if self.status_callback:
                 self.status_callback(f"Synthesis generation error: {str(e)[:50]}")
-            print(f"Error generating synthesis: {e}")
-            import traceback
-            traceback.print_exc()
+            LOGGER.exception("Error generating synthesis")
             return None

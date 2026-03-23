@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, Callable, List, Optional
 
@@ -109,6 +110,9 @@ async def fetch_models(
         raise ModelFetchError(
             f"No models found at {model_url}. Check whether the base URL already includes a path like /v1 or /v1/models."
         )
+    except asyncio.TimeoutError as exc:
+        provider_name = provider_label(provider.provider_type) if provider_label else provider.provider_type
+        raise ModelFetchError(f"{provider_name} request timed out after {timeout_sec} seconds") from exc
     except Exception as exc:
         if isinstance(exc, ModelFetchError):
             raise
@@ -146,17 +150,20 @@ async def call_model(
             payload["options"] = {"temperature": float(temperature)}
         if debug_hook:
             debug_hook("CALL payload", {"provider": provider.provider_type, "url": url, "payload": payload})
-        async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
-            text = await resp.text()
-            if resp.status != 200:
-                raise RuntimeError(f"HTTP {resp.status} for {model}:\n{text[:800]}")
-            try:
-                data = json.loads(text)
-            except Exception as exc:
-                raise RuntimeError(f"Non-JSON response for {model}:\n{text[:800]}") from exc
-            if debug_hook:
-                debug_hook("CALL raw_response", data)
-            return data.get("message", {}).get("content", "")
+        try:
+            async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status} for {model}:\n{text[:800]}")
+                try:
+                    data = json.loads(text)
+                except Exception as exc:
+                    raise RuntimeError(f"Non-JSON response for {model}:\n{text[:800]}") from exc
+                if debug_hook:
+                    debug_hook("CALL raw_response", data)
+                return data.get("message", {}).get("content", "")
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(f"Model timed out after {timeout_sec} seconds: {model}") from exc
 
     messages: list[dict[str, Any]] = []
     if sys_prompt:
@@ -191,14 +198,17 @@ async def call_model(
 
     if debug_hook:
         debug_hook("CALL payload", {"provider": provider.provider_type, "url": url, "payload": payload})
-    async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
-        text = await resp.text()
-        if resp.status != 200:
-            raise RuntimeError(f"HTTP {resp.status} for {model}:\n{text[:800]}")
-        try:
-            data = json.loads(text)
-        except Exception as exc:
-            raise RuntimeError(f"Non-JSON response for {model}:\n{text[:800]}") from exc
-        if debug_hook:
-            debug_hook("CALL raw_response", data)
-        return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    try:
+        async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                raise RuntimeError(f"HTTP {resp.status} for {model}:\n{text[:800]}")
+            try:
+                data = json.loads(text)
+            except Exception as exc:
+                raise RuntimeError(f"Non-JSON response for {model}:\n{text[:800]}") from exc
+            if debug_hook:
+                debug_hook("CALL raw_response", data)
+            return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(f"Model timed out after {timeout_sec} seconds: {model}") from exc

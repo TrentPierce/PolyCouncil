@@ -26,6 +26,7 @@ def build_deliberation_summary_html(
     vote_messages = details.get("vote_messages", {}) or {}
     voters_used = details.get("voters_used", []) or []
     timings_ms = details.get("timings_ms", {}) or {}
+    errors = details.get("errors", {}) or {}
     rubric_weights = normalize_rubric_weights(details.get("rubric_weights"))
 
     ranking_rows = "".join(
@@ -42,6 +43,10 @@ def build_deliberation_summary_html(
         f"<li><strong>{_esc(escape_text, short_id(voter))}</strong> · {_esc(escape_text, msg)}</li>"
         for voter, msg in vote_messages.items()
     ) if vote_messages else ""
+    error_rows = "".join(
+        f"<li><strong>{_esc(escape_text, short_id(model_id))}</strong> · {_esc(escape_text, message)}</li>"
+        for model_id, message in errors.items()
+    ) if errors else ""
 
     winner_answer_html = safe_markdown_html(answers.get(winner, ""))
     mid_color = colors["text_secondary"]
@@ -72,6 +77,11 @@ def build_deliberation_summary_html(
         html.extend([
             "<div style='font-weight:700; margin-bottom:6px;'>Ballot notes</div>",
             f"<ul style='margin-top:0; margin-bottom:16px;'>{note_rows}</ul>",
+        ])
+    if error_rows:
+        html.extend([
+            "<div style='font-weight:700; margin-bottom:6px;'>Model issues</div>",
+            f"<ul style='margin-top:0; margin-bottom:16px;'>{error_rows}</ul>",
         ])
     html.extend([
         "<div style='font-weight:700; margin-bottom:6px;'>Winning answer</div>",
@@ -135,7 +145,11 @@ def build_ballots_html(
                 candidate_scores = ballot.get("scores", {}).get(candidate)
                 if candidate_scores:
                     weighted = sum(candidate_scores[k] * rubric_weights[k] for k in rubric_weights.keys())
-                    ranked.append(f"{_esc(escape_text, short_id(candidate))}: {weighted}")
+                    criteria = ", ".join(
+                        f"{key} {candidate_scores.get(key, 0)}×{rubric_weights.get(key, 0)}"
+                        for key in rubric_weights.keys()
+                    )
+                    ranked.append(f"{_esc(escape_text, short_id(candidate))}: {weighted} [{_esc(escape_text, criteria)}]")
             sections.append(f"<li><strong>{_esc(escape_text, short_id(voter))}</strong> · {'; '.join(ranked)}</li>")
         sections.append("</ul>")
     if invalid_votes:

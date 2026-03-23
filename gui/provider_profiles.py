@@ -4,6 +4,9 @@ from typing import Callable
 
 from PySide6 import QtWidgets
 
+from constants import INTERNAL_GAP, PADDING_SM, dp
+from ui.factories import make_button
+
 
 def clear_layout(layout: QtWidgets.QLayout):
     while layout.count():
@@ -24,13 +27,13 @@ def build_provider_profile_row(
 ) -> QtWidgets.QWidget:
     row = QtWidgets.QWidget()
     row_layout = QtWidgets.QHBoxLayout(row)
-    row_layout.setContentsMargins(2, 2, 2, 2)
-    row_layout.setSpacing(6)
+    row_layout.setContentsMargins(dp(PADDING_SM), dp(PADDING_SM), dp(PADDING_SM), dp(PADDING_SM))
+    row_layout.setSpacing(dp(INTERNAL_GAP))
 
     label = QtWidgets.QLabel(summary)
-    use_btn = QtWidgets.QPushButton("Use")
-    load_btn = QtWidgets.QPushButton("Load")
-    remove_btn = QtWidgets.QPushButton("Remove")
+    use_btn = make_button("Use", variant="secondary")
+    load_btn = make_button("Load", variant="secondary")
+    remove_btn = make_button("Remove", variant="danger")
 
     use_btn.clicked.connect(lambda _checked=False, pid=profile_id: on_use(pid))
     load_btn.clicked.connect(lambda _checked=False, pid=profile_id: on_load(pid))

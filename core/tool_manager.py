@@ -6,9 +6,12 @@ Handles web search detection, visual model detection, and file parsing.
 import base64
 import json
 import mimetypes
+import logging
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 import aiohttp
+
+LOGGER = logging.getLogger(__name__)
 
 # Try to import file parsing libraries
 try:
@@ -59,7 +62,7 @@ class FileParser:
                     return None
                     
         except Exception as e:
-            print(f"Error parsing file {file_path}: {e}")
+            LOGGER.exception("Error parsing file %s", file_path)
             return None
     
     @staticmethod
@@ -74,8 +77,8 @@ class FileParser:
                 for page in pdf_reader.pages:
                     text_parts.append(page.extract_text())
             return '\n\n'.join(text_parts)
-        except Exception as e:
-            print(f"PDF parsing error: {e}")
+        except Exception:
+            LOGGER.exception("PDF parsing error")
             return None
     
     @staticmethod
@@ -87,8 +90,8 @@ class FileParser:
             doc = Document(file_path)
             paragraphs = [para.text for para in doc.paragraphs]
             return '\n\n'.join(paragraphs)
-        except Exception as e:
-            print(f"DOCX parsing error: {e}")
+        except Exception:
+            LOGGER.exception("DOCX parsing error")
             return None
     
     @staticmethod
@@ -182,8 +185,8 @@ class ModelCapabilityDetector:
         try:
             data = await ModelCapabilityDetector.fetch_models_data(session, base_url)
             return ModelCapabilityDetector.detect_web_search_from_data(data, model)
-        except Exception as e:
-            print(f"Error detecting web search for {model}: {e}")
+        except Exception:
+            LOGGER.exception("Error detecting web search for %s", model)
             return False
     
     @staticmethod
@@ -191,8 +194,8 @@ class ModelCapabilityDetector:
         try:
             data = await ModelCapabilityDetector.fetch_models_data(session, base_url)
             return ModelCapabilityDetector.detect_visual_from_data(data, model)
-        except Exception as e:
-            print(f"Error detecting visual capabilities for {model}: {e}")
+        except Exception:
+            LOGGER.exception("Error detecting visual capabilities for %s", model)
             return False
     
     @staticmethod
@@ -230,7 +233,7 @@ class ModelCapabilityDetector:
                 
                 return f"data:{mime_type};base64,{encoded}"
                 
-        except Exception as e:
-            print(f"Error encoding image {image_path}: {e}")
+        except Exception:
+            LOGGER.exception("Error encoding image %s", image_path)
             return None
 

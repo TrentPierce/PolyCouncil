@@ -4,6 +4,8 @@ from typing import Callable, Iterable, Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from constants import FONT_LG, PADDING_MD, dp, make_font
+
 
 def populate_persona_library_list(
     list_widget: QtWidgets.QListWidget,
@@ -21,7 +23,7 @@ def populate_persona_library_list(
             continue
         item = QtWidgets.QListWidgetItem(name)
         if persona.get("builtin", False):
-            item.setForeground(QtGui.QColor("#666"))
+            item.setForeground(QtGui.QColor(QtWidgets.QApplication.palette().color(QtGui.QPalette.Mid)))
         list_widget.addItem(item)
 
     if current_name:
@@ -47,8 +49,8 @@ def build_persona_preview_html(
     prompt = persona.get("prompt") or "No prompt configured."
     persona_type = "Built-in" if persona.get("builtin", False) else "Custom"
     return (
-        f"<div style='font-size:18px; font-weight:700; margin-bottom:6px;'>{escape_text(persona['name'])}</div>"
-        f"<div style='margin-bottom:10px; color:{colors['text_secondary']};'>"
+        f"<div style='font-size:{FONT_LG}pt; font-weight:700; margin-bottom:{PADDING_MD}px;'>{escape_text(persona['name'])}</div>"
+        f"<div style='margin-bottom:{PADDING_MD}px; color:{colors['text_secondary']};'>"
         f"{persona_type} persona &middot; Assigned to {assignment_count} model(s)</div>"
         f"{render_markdown(prompt)}"
     )

@@ -5,6 +5,9 @@ from typing import Callable, Dict, Iterable, Optional
 
 from PySide6 import QtCore, QtWidgets
 
+from constants import INTERNAL_GAP, MIN_TOUCH_TARGET, PADDING_LG, PADDING_MD, dp
+from ui.factories import make_button
+
 
 @dataclass
 class ModelListWidgets:
@@ -96,24 +99,23 @@ def build_model_row(
         row_widget.showPersonaButton(personas_enabled)
     else:
         row_widget = QtWidgets.QWidget()
-        row_widget.setMinimumHeight(34)
+        row_widget.setMinimumHeight(dp(MIN_TOUCH_TARGET))
         row_layout = QtWidgets.QHBoxLayout(row_widget)
-        row_layout.setContentsMargins(6, 4, 6, 4)
-        row_layout.setSpacing(8)
+        row_layout.setContentsMargins(dp(PADDING_LG), dp(PADDING_MD), dp(PADDING_LG), dp(PADDING_MD))
+        row_layout.setSpacing(dp(INTERNAL_GAP))
 
         checkbox = QtWidgets.QCheckBox(model_id)
         checkbox.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
         checkbox.setAccessibleName(f"Model selector {model_id}")
 
-        persona_button = QtWidgets.QPushButton("Persona")
-        persona_button.setFixedWidth(118)
-        persona_button.setFixedHeight(28)
+        persona_button = make_button("Persona", variant="secondary")
+        persona_button.setMinimumWidth(dp(120))
         persona_button.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
 
         meta_label = QtWidgets.QLabel(meta_text)
         meta_label.setObjectName("HintLabel")
         meta_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-        meta_label.setMinimumWidth(170)
+        meta_label.setMinimumWidth(dp(170))
 
         row_layout.addWidget(checkbox, stretch=1)
         row_layout.addWidget(meta_label, stretch=0)
@@ -191,7 +193,7 @@ def apply_persona_visibility(
         if enabled:
             button.setStyleSheet("")
         else:
-            button.setStyleSheet("QPushButton { color: #888; background-color: #333; }")
+            button.setObjectName("SecondaryButton")
 
 
 def filter_model_rows(

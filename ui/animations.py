@@ -11,12 +11,22 @@ from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+REDUCE_MOTION = False
+
+
+def set_reduce_motion(enabled: bool):
+    global REDUCE_MOTION
+    REDUCE_MOTION = bool(enabled)
+
 
 class FadeIn:
     """Fade a widget in from transparent to fully opaque."""
 
     @staticmethod
     def run(widget: QtWidgets.QWidget, duration_ms: int = 300, start_val: float = 0.0, end_val: float = 1.0):
+        if REDUCE_MOTION:
+            widget.show()
+            return None
         effect = QtWidgets.QGraphicsOpacityEffect(widget)
         widget.setGraphicsEffect(effect)
         anim = QtCore.QPropertyAnimation(effect, b"opacity", widget)
@@ -33,6 +43,10 @@ class FadeOut:
 
     @staticmethod
     def run(widget: QtWidgets.QWidget, duration_ms: int = 250, hide_on_finish: bool = True):
+        if REDUCE_MOTION:
+            if hide_on_finish:
+                widget.hide()
+            return None
         effect = widget.graphicsEffect()
         if not isinstance(effect, QtWidgets.QGraphicsOpacityEffect):
             effect = QtWidgets.QGraphicsOpacityEffect(widget)
@@ -58,6 +72,9 @@ class SlideIn:
         duration_ms: int = 350,
         distance: int = 80,
     ):
+        if REDUCE_MOTION:
+            widget.show()
+            return None
         start_pos = widget.pos()
         if direction == "right":
             offset_pos = QtCore.QPoint(start_pos.x() + distance, start_pos.y())
@@ -87,6 +104,8 @@ class PulseEffect:
 
     @staticmethod
     def run(widget: QtWidgets.QWidget, duration_ms: int = 1200):
+        if REDUCE_MOTION:
+            return None
         effect = QtWidgets.QGraphicsOpacityEffect(widget)
         widget.setGraphicsEffect(effect)
         anim = QtCore.QPropertyAnimation(effect, b"opacity", widget)
@@ -104,6 +123,10 @@ class SmoothCollapse:
 
     @staticmethod
     def collapse(widget: QtWidgets.QWidget, duration_ms: int = 250):
+        if REDUCE_MOTION:
+            widget.hide()
+            widget.setMaximumHeight(0)
+            return None
         anim = QtCore.QPropertyAnimation(widget, b"maximumHeight", widget)
         anim.setDuration(duration_ms)
         anim.setStartValue(widget.sizeHint().height())
@@ -115,6 +138,10 @@ class SmoothCollapse:
 
     @staticmethod
     def expand(widget: QtWidgets.QWidget, target_height: int = 0, duration_ms: int = 250):
+        if REDUCE_MOTION:
+            widget.show()
+            widget.setMaximumHeight(16777215)
+            return None
         if target_height <= 0:
             target_height = widget.sizeHint().height()
         widget.setMaximumHeight(0)
