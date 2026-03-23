@@ -25,6 +25,23 @@ try:
     from core.api_client import ModelFetchError, call_model, fetch_models
     from core.discussion_manager import DiscussionManager
     from core import result_presenter
+    from core.personas import (
+        DEFAULT_PERSONAS_PATH,
+        USER_PERSONAS_PATH,
+        add_user_persona,
+        assignment_count,
+        build_persona_config,
+        cleanup_persona_assignments,
+        clear_persona_assignment,
+        merge_persona_library,
+        persona_by_name,
+        persona_names,
+        persona_prompt,
+        rename_persona_assignments,
+        sort_personas_inplace,
+        update_user_persona,
+        delete_user_persona,
+    )
     from core.provider_config import (
         API_SERVICE_CUSTOM,
         API_SERVICE_GEMINI,
@@ -58,6 +75,21 @@ except ImportError:
     fetch_models = None
     DiscussionManager = None
     result_presenter = None
+    DEFAULT_PERSONAS_PATH = None
+    USER_PERSONAS_PATH = None
+    add_user_persona = None
+    assignment_count = None
+    build_persona_config = None
+    cleanup_persona_assignments = None
+    clear_persona_assignment = None
+    merge_persona_library = None
+    persona_by_name = None
+    persona_names = None
+    persona_prompt = None
+    rename_persona_assignments = None
+    sort_personas_inplace = None
+    update_user_persona = None
+    delete_user_persona = None
     API_SERVICE_CUSTOM = "custom"
     API_SERVICE_OPENAI = "openai"
     API_SERVICE_OPENROUTER = "openrouter"
@@ -112,11 +144,29 @@ except ImportError:
     _UI_AVAILABLE = False
 
 try:
-    from gui import build_provider_profile_row, build_workspace_panel, clear_layout
+    from gui import (
+        apply_persona_visibility,
+        build_model_badge_text,
+        build_persona_preview_html,
+        build_provider_profile_row,
+        build_workspace_panel,
+        clear_layout,
+        filter_model_rows,
+        make_unique_display_model_name,
+        populate_model_rows,
+        populate_persona_library_list,
+    )
 except ImportError:
+    apply_persona_visibility = None
+    build_model_badge_text = None
+    build_persona_preview_html = None
     build_provider_profile_row = None
     build_workspace_panel = None
     clear_layout = None
+    filter_model_rows = None
+    make_unique_display_model_name = None
+    populate_model_rows = None
+    populate_persona_library_list = None
 
 # -----------------------
 # Debug logging switches
@@ -124,17 +174,6 @@ except ImportError:
 DEBUG_VOTING = True                 # set False to silence
 LOG_TRUNCATE: Optional[int] = None  # e.g., 8000 to cap output, or None for full
 LOG_SINK: Optional[Callable[[str, str], None]] = None
-
-DEFAULT_PERSONAS: List[dict] = [
-    {"name": "None", "prompt": None, "builtin": True},
-    {"name": "Meticulous fact-checker", "prompt": "You are a meticulous fact-checker. Prefer primary sources and verify each claim.", "builtin": True},
-    {"name": "Pragmatic engineer", "prompt": "You are a pragmatic engineer. Focus on feasible steps, tradeoffs, and edge cases.", "builtin": True},
-    {"name": "Cautious risk assessor", "prompt": "You are a cautious risk assessor. Identify failure modes and propose mitigations.", "builtin": True},
-    {"name": "Clear teacher", "prompt": "You are a clear teacher. Explain concepts simply with short examples where helpful.", "builtin": True},
-    {"name": "Structured Data Analyst", "prompt": "You are a data analyst. Structure answers into bullets, highlight assumptions and limits.", "builtin": True},
-    {"name": "Systems thinker", "prompt": "You are a systems thinker. Map long-term interactions and consequences.", "builtin": True},
-]
-
 
 def _dbg(label: str, text: Any):
     if not DEBUG_VOTING:
@@ -340,12 +379,9 @@ APP_DIR = Path(__file__).resolve().parent
 LEGACY_ROOT = legacy_root_dir() if legacy_root_dir else APP_DIR
 if migrate_legacy_state:
     migrate_legacy_state()
-CONFIG_DIR = app_config_dir() if app_config_dir else APP_DIR
 DATA_DIR = app_data_dir() if app_data_dir else APP_DIR
 LOG_DIR = app_log_dir() if app_log_dir else APP_DIR
 DB_PATH = DATA_DIR / "council_stats.db"
-DEFAULT_PERSONAS_PATH = APP_DIR / "config" / "default_personas.json"
-USER_PERSONAS_PATH = CONFIG_DIR / "user_personas.json"
 def log_unhandled_exception(exc_type, exc_value, exc_tb):
     try:
         ts = datetime.datetime.now().isoformat(timespec="seconds")
@@ -876,7 +912,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
             self.provider_profiles = [self._current_profile_payload()]
         self._render_provider_profiles()
 
-        self.personas = self._merge_persona_library(s.get("personas", []))
+        self.personas = merge_persona_library(s.get("personas", [])) if merge_persona_library else []
         self.persona_assignments: Dict[str, str] = dict(s.get("persona_assignments", {}) or {})
         self._cleanup_persona_assignments()
 
@@ -2100,22 +2136,30 @@ class CouncilWindow(QtWidgets.QMainWindow):
             return
         query = self.persona_search_edit.text().strip().lower() if hasattr(self, "persona_search_edit") else ""
         current_name = self.persona_library_list.currentItem().text() if self.persona_library_list.currentItem() else ""
-        self.persona_library_list.clear()
-        for persona in self.personas:
-            name = persona["name"]
-            prompt = persona.get("prompt") or ""
-            if query and query not in name.lower() and query not in prompt.lower():
-                continue
-            item = QtWidgets.QListWidgetItem(name)
-            if persona.get("builtin", False):
-                item.setForeground(QtGui.QColor("#666"))
-            self.persona_library_list.addItem(item)
-        if current_name:
-            matches = self.persona_library_list.findItems(current_name, QtCore.Qt.MatchExactly)
-            if matches:
-                self.persona_library_list.setCurrentItem(matches[0])
-        if not self.persona_library_list.currentItem() and self.persona_library_list.count():
-            self.persona_library_list.setCurrentRow(0)
+        if populate_persona_library_list:
+            populate_persona_library_list(
+                self.persona_library_list,
+                self.personas,
+                query=query,
+                current_name=current_name,
+            )
+        else:
+            self.persona_library_list.clear()
+            for persona in self.personas:
+                name = persona["name"]
+                prompt = persona.get("prompt") or ""
+                if query and query not in name.lower() and query not in prompt.lower():
+                    continue
+                item = QtWidgets.QListWidgetItem(name)
+                if persona.get("builtin", False):
+                    item.setForeground(QtGui.QColor("#666"))
+                self.persona_library_list.addItem(item)
+            if current_name:
+                matches = self.persona_library_list.findItems(current_name, QtCore.Qt.MatchExactly)
+                if matches:
+                    self.persona_library_list.setCurrentItem(matches[0])
+            if not self.persona_library_list.currentItem() and self.persona_library_list.count():
+                self.persona_library_list.setCurrentRow(0)
         self._update_persona_preview_panel()
 
     def _update_persona_preview_panel(self):
@@ -2171,13 +2215,10 @@ class CouncilWindow(QtWidgets.QMainWindow):
         prompt = self._prompt_for_persona_text("Persona System Prompt")
         if prompt is None:
             return
-        persona_id = f"u_{uuid.uuid4().hex[:8]}"
         self.personas.append({"name": name, "prompt": prompt if prompt else None, "builtin": False})
         try:
-            user_personas = json.loads(USER_PERSONAS_PATH.read_text(encoding="utf-8")) if USER_PERSONAS_PATH.exists() else []
-            user_personas.append({"id": persona_id, "name": name, "prompt_instruction": prompt if prompt else ""})
-            USER_PERSONAS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            USER_PERSONAS_PATH.write_text(json.dumps(user_personas, indent=2, ensure_ascii=False), encoding="utf-8")
+            if add_user_persona:
+                add_user_persona(name, prompt if prompt else None)
         except Exception as e:
             print(f"Error saving user persona: {e}")
         self._sort_personas_inplace()
@@ -2210,20 +2251,16 @@ class CouncilWindow(QtWidgets.QMainWindow):
         persona["name"] = new_name
         persona["prompt"] = prompt if prompt else None
         try:
-            if USER_PERSONAS_PATH.exists():
-                user_personas = json.loads(USER_PERSONAS_PATH.read_text(encoding="utf-8"))
-                for entry in user_personas:
-                    if entry.get("name") == name:
-                        entry["name"] = new_name
-                        entry["prompt_instruction"] = prompt if prompt else ""
-                        break
-                USER_PERSONAS_PATH.write_text(json.dumps(user_personas, indent=2, ensure_ascii=False), encoding="utf-8")
+            if update_user_persona:
+                update_user_persona(name, new_name, prompt if prompt else None)
         except Exception as e:
             print(f"Error updating user persona: {e}")
         if name != new_name:
-            for model, assigned in list(self.persona_assignments.items()):
-                if assigned == name:
-                    self.persona_assignments[model] = new_name
+            self.persona_assignments = (
+                rename_persona_assignments(self.persona_assignments, name, new_name)
+                if rename_persona_assignments
+                else self.persona_assignments
+            )
         self._sort_personas_inplace()
         self._save_persona_state()
         self._refresh_persona_combos()
@@ -2247,15 +2284,15 @@ class CouncilWindow(QtWidgets.QMainWindow):
             return
         self.personas = [p for p in self.personas if p["name"] != name]
         try:
-            if USER_PERSONAS_PATH.exists():
-                user_personas = json.loads(USER_PERSONAS_PATH.read_text(encoding="utf-8"))
-                user_personas = [entry for entry in user_personas if entry.get("name") != name]
-                USER_PERSONAS_PATH.write_text(json.dumps(user_personas, indent=2, ensure_ascii=False), encoding="utf-8")
+            if delete_user_persona:
+                delete_user_persona(name)
         except Exception as e:
             print(f"Error deleting user persona: {e}")
-        for model, assigned in list(self.persona_assignments.items()):
-            if assigned == name:
-                self.persona_assignments[model] = "None"
+        self.persona_assignments = (
+            clear_persona_assignment(self.persona_assignments, name)
+            if clear_persona_assignment
+            else self.persona_assignments
+        )
         self._save_persona_state()
         self._refresh_persona_combos()
         self._refresh_persona_library_panel()
@@ -2510,21 +2547,19 @@ class CouncilWindow(QtWidgets.QMainWindow):
         """Update visibility and enabled state of persona buttons - show and enable when personas are enabled"""
         if not hasattr(self, 'model_persona_combos') or not self.model_persona_combos:
             return
-        
-        # Show buttons only when personas are enabled
         enabled = bool(self.use_roles)
-        for model, btn in list(self.model_persona_combos.items()):
-            if not btn or not isinstance(btn, QtWidgets.QPushButton):
-                continue
-            # Show buttons when personas are enabled, hide when disabled
-            btn.setVisible(enabled)
-            btn.setEnabled(enabled)
-            # Update button style
-            if enabled:
-                btn.setStyleSheet("")
-            else:
-                btn.setStyleSheet("QPushButton { color: #888; background-color: #333; }")
-        
+        if apply_persona_visibility:
+            apply_persona_visibility(self.model_persona_combos, enabled=enabled)
+        else:
+            for btn in list(self.model_persona_combos.values()):
+                if not btn or not isinstance(btn, QtWidgets.QPushButton):
+                    continue
+                btn.setVisible(enabled)
+                btn.setEnabled(enabled)
+                if enabled:
+                    btn.setStyleSheet("")
+                else:
+                    btn.setStyleSheet("QPushButton { color: #888; background-color: #333; }")
         # Force layout update
         if hasattr(self, 'models_inner') and self.models_inner:
             self.models_inner.updateGeometry()
@@ -2556,16 +2591,9 @@ class CouncilWindow(QtWidgets.QMainWindow):
         if persona_name not in self._persona_names():
             persona_name = "None"
         self.persona_assignments[model] = persona_name
-        
-        # Update button text (truncate if too long)
-        display_text = persona_name if persona_name != "None" else "Persona"
-        if len(display_text) > 12:
-            display_text = display_text[:10] + ".."
-        button.setText(display_text)
-        button.setToolTip(persona_name if persona_name != "None" else "Select persona")
-        
+        self._refresh_persona_combos()
         self._save_persona_state()
-        
+
         # Update the menu to show the selected persona
         menu = button.menu()
         if menu:
@@ -2591,108 +2619,33 @@ class CouncilWindow(QtWidgets.QMainWindow):
             self._set_status(f"Debug logs: {'ON' if self.debug_enabled else 'OFF'}")
 
     def _merge_persona_library(self, stored: Iterable[dict]) -> List[dict]:
-        library: Dict[str, dict] = {}
-        
-        # Load default personas from config/default_personas.json
-        if DEFAULT_PERSONAS_PATH.exists():
-            try:
-                with open(DEFAULT_PERSONAS_PATH, 'r', encoding='utf-8') as f:
-                    default_personas = json.load(f)
-                    for persona in default_personas:
-                        name = persona.get("name")
-                        if name:
-                            library[name] = {
-                                "name": name,
-                                "prompt": persona.get("prompt_instruction"),
-                                "builtin": True,
-                            }
-            except Exception as e:
-                print(f"Error loading default personas: {e}")
-        
-        # Load user personas from config/user_personas.json
-        if USER_PERSONAS_PATH.exists():
-            try:
-                with open(USER_PERSONAS_PATH, 'r', encoding='utf-8') as f:
-                    user_personas = json.load(f)
-                    for persona in user_personas:
-                        name = persona.get("name")
-                        if name:
-                            library[name] = {
-                                "name": name,
-                                "prompt": persona.get("prompt_instruction"),
-                                "builtin": False,
-                            }
-            except Exception as e:
-                print(f"Error loading user personas: {e}")
-        
-        # Also merge from legacy DEFAULT_PERSONAS
-        for persona in DEFAULT_PERSONAS:
-            name = persona.get("name")
-            if name and name not in library:
-                library[name] = dict(persona)
-        
-        # Merge from stored (legacy council_settings.json personas)
-        for entry in stored or []:
-            name = entry.get("name")
-            if not name:
-                continue
-            entry_prompt = entry.get("prompt")
-            entry_builtin = bool(entry.get("builtin", False))
-            if name in library and library[name].get("builtin"):
-                # keep builtin prompt for defaults
-                continue
-            library[name] = {
-                "name": str(name),
-                "prompt": entry_prompt if entry_prompt is not None else None,
-                "builtin": entry_builtin,
-            }
-
-        personas = list(library.values())
-
-        def sort_key(persona: dict) -> tuple[int, str]:
-            if persona["name"] == "None":
-                return (0, "")
-            return (
-                1 if persona.get("builtin", False) else 2,
-                persona["name"].lower(),
-            )
-
-        personas.sort(key=sort_key)
-        return personas
+        if merge_persona_library:
+            return merge_persona_library(stored)
+        return []
 
     def _sort_personas_inplace(self):
-        def sort_key(persona: dict) -> tuple[int, str]:
-            if persona["name"] == "None":
-                return (0, "")
-            return (
-                1 if persona.get("builtin", False) else 2,
-                persona["name"].lower(),
-            )
-
-        self.personas.sort(key=sort_key)
+        if sort_personas_inplace:
+            sort_personas_inplace(self.personas)
 
     def _persona_names(self) -> List[str]:
-        return [persona["name"] for persona in self.personas]
+        return persona_names(self.personas) if persona_names else [persona["name"] for persona in self.personas]
 
     def _persona_prompt(self, name: str) -> Optional[str]:
-        for persona in self.personas:
-            if persona["name"] == name:
-                return persona.get("prompt")
-        return None
+        return persona_prompt(self.personas, name) if persona_prompt else None
 
     def _persona_by_name(self, name: str) -> Optional[dict]:
-        for persona in self.personas:
-            if persona["name"] == name:
-                return persona
-        return None
+        return persona_by_name(self.personas, name) if persona_by_name else None
 
     def _cleanup_persona_assignments(self):
-        names = set(self._persona_names())
-        dirty = False
-        for model, persona_name in list(self.persona_assignments.items()):
-            if persona_name not in names:
-                self.persona_assignments[model] = "None"
-                dirty = True
+        if cleanup_persona_assignments:
+            self.persona_assignments, dirty = cleanup_persona_assignments(self.personas, self.persona_assignments)
+        else:
+            names = set(self._persona_names())
+            dirty = False
+            for model, persona_name in list(self.persona_assignments.items()):
+                if persona_name not in names:
+                    self.persona_assignments[model] = "None"
+                    dirty = True
         if dirty:
             self._save_persona_state()
 
@@ -2718,19 +2671,54 @@ class CouncilWindow(QtWidgets.QMainWindow):
             assigned = self.persona_assignments.get(model, "None")
             if assigned not in names:
                 assigned = "None"
-            
-            # Update button text
-            display_text = assigned if assigned != "None" else "Persona"
-            if len(display_text) > 12:
-                display_text = display_text[:10] + ".."
-            btn.setText(display_text)
-            btn.setToolTip(assigned if assigned != "None" else "Select persona")
+            if hasattr(btn, "setPersonaText"):
+                btn.setPersonaText(assigned)
+            else:
+                display_text = assigned if assigned != "None" else "Persona"
+                if len(display_text) > 12:
+                    display_text = display_text[:10] + ".."
+                btn.setText(display_text)
+                btn.setToolTip(assigned if assigned != "None" else "Select persona")
 
     def _persona_assigned(self, model: str, persona_name: str):
         if persona_name not in self._persona_names():
             persona_name = "None"
         self.persona_assignments[model] = persona_name
         self._save_persona_state()
+
+    def _update_persona_preview_panel(self):
+        if not hasattr(self, "persona_preview"):
+            return
+        item = self.persona_library_list.currentItem() if hasattr(self, "persona_library_list") else None
+        if not item:
+            self.persona_preview.setHtml(
+                self._placeholder_html("Persona Preview", "Select a persona to inspect its prompt and assignment behavior.")
+            )
+            return
+        persona = self._persona_by_name(item.text())
+        if not persona:
+            self.persona_preview.setHtml(self._placeholder_html("Persona Preview", "Persona not found."))
+            return
+        colors = self._surface_tokens()
+        if build_persona_preview_html and escape_text and assignment_count:
+            html = build_persona_preview_html(
+                persona,
+                assignment_count=assignment_count(self.persona_assignments, persona["name"]),
+                colors=colors,
+                render_markdown=self._safe_markdown_html,
+                escape_text=escape_text,
+                placeholder_html=self._placeholder_html,
+            )
+        else:
+            prompt = persona.get("prompt") or "No prompt configured."
+            assigned_count = sum(1 for assigned in self.persona_assignments.values() if assigned == persona["name"])
+            html = (
+                f"<div style='font-size:18px; font-weight:700; margin-bottom:6px;'>{escape_text(persona['name']) if escape_text else persona['name']}</div>"
+                f"<div style='margin-bottom:10px; color:{colors['text_secondary']};'>"
+                f"{'Built-in' if persona.get('builtin', False) else 'Custom'} persona &middot; Assigned to {assigned_count} model(s)</div>"
+                f"{self._safe_markdown_html(prompt)}"
+            )
+        self.persona_preview.setHtml(html)
 
     def _concurrency_changed(self, value: int):
         save_settings({"max_concurrency": int(value)})
@@ -2840,6 +2828,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
         return provider_label(provider.provider_type)
 
     def _make_display_model_name(self, provider: ProviderConfig, raw_model: str) -> str:
+        if make_unique_display_model_name:
+            return make_unique_display_model_name(raw_model, self._provider_tag(provider), self.model_actual_ids)
         base_name = f"{self._provider_tag(provider)} :: {raw_model}"
         if base_name not in self.model_actual_ids:
             return base_name
@@ -3015,14 +3005,20 @@ class CouncilWindow(QtWidgets.QMainWindow):
     def _model_badge_text(self, model: str) -> str:
         provider = self.model_provider_map.get(model)
         provider_badge = self._provider_tag(provider) if provider else "Unknown"
+        session_timings = (self.last_session_record or {}).get("timings_ms", {}) or {}
+        latency_ms = session_timings.get(model)
+        if build_model_badge_text:
+            return build_model_badge_text(
+                provider_badge,
+                capabilities=self.model_capabilities.get(model, {}),
+                latency_ms=latency_ms,
+            )
         caps = self.model_capabilities.get(model, {})
         cap_parts = []
         if caps.get("visual"):
             cap_parts.append("vision")
         if caps.get("web_search"):
             cap_parts.append("web")
-        session_timings = (self.last_session_record or {}).get("timings_ms", {}) or {}
-        latency_ms = session_timings.get(model)
         details = [provider_badge]
         if cap_parts:
             details.append(", ".join(cap_parts))
@@ -3031,109 +3027,50 @@ class CouncilWindow(QtWidgets.QMainWindow):
         return " | ".join(details)
 
     def _populate_models(self):
-        # clear UI - remove ALL items including stretches
-        while self.models_layout.count():
-            item = self.models_layout.takeAt(0)
-            if item.widget():
-                item.widget().setParent(None)
-            elif item.spacerItem():
-                # Remove spacer items too
-                pass
-            del item
-        self.model_checks.clear()
-        self.model_persona_combos.clear()
-        self.model_meta_labels.clear()
-        self.model_rows.clear()
-        # Add stretch at the end
-        self.models_layout.addStretch(1)
-
-        # Ensure personas are initialized
         if not hasattr(self, 'personas') or not self.personas:
             s = load_settings()
             self.personas = self._merge_persona_library(s.get("personas", []))
             if not hasattr(self, 'persona_assignments'):
                 self.persona_assignments = dict(s.get("persona_assignments", {}) or {})
 
-        persona_names = self._persona_names()
-        if not persona_names:
-            # Fallback: ensure at least "None" exists
+        persona_name_list = self._persona_names()
+        if not persona_name_list:
             self.personas = [{"name": "None", "prompt": None, "builtin": True}]
-            persona_names = ["None"]
+            persona_name_list = ["None"]
 
-        for m in self.models:
-            assigned = self.persona_assignments.get(m, "None")
-            if assigned not in persona_names:
-                assigned = "None"
-            
-            pconfig = self.model_provider_map.get(m)
-            pname = provider_label(pconfig.provider_type) if pconfig else "Unknown"
-            mtext = self._model_badge_text(m)
-
-            if _UI_AVAILABLE:
-                row_widget = ModelCard(m, pname, mtext)
-                cb = row_widget.checkbox
-                persona_btn = row_widget.persona_btn
-                meta_label = row_widget.meta_label
-                row_widget.setPersonaText(assigned)
-                row_widget.showPersonaButton(self.use_roles)
-            else:
-                row_widget = QtWidgets.QWidget()
-                row_widget.setMinimumHeight(34)
-                row_layout = QtWidgets.QHBoxLayout(row_widget)
-                row_layout.setContentsMargins(6, 4, 6, 4)
-                row_layout.setSpacing(8)
-    
-                cb = QtWidgets.QCheckBox(m)
-                cb.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
-                cb.setAccessibleName(f"Model selector {m}")
-                
-                persona_btn = QtWidgets.QPushButton("Persona")
-                persona_btn.setFixedWidth(118)
-                persona_btn.setFixedHeight(28)
-                persona_btn.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Fixed)
-                
-                display_text = assigned if assigned != "None" else "Persona"
-                if len(display_text) > 12:
-                    display_text = display_text[:10] + ".."
-                persona_btn.setText(display_text)
-                persona_btn.setToolTip(assigned if assigned != "None" else "Select persona")
-                
-                persona_btn.setVisible(self.use_roles)
-                persona_btn.setEnabled(self.use_roles)
-                
-                row_layout.addWidget(cb, stretch=1)
-    
-                meta_label = QtWidgets.QLabel(mtext)
-                meta_label.setObjectName("HintLabel")
-                meta_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
-                meta_label.setMinimumWidth(170)
-                row_layout.addWidget(meta_label, stretch=0)
-    
-                row_layout.addWidget(persona_btn, stretch=0)
-                row_layout.setAlignment(persona_btn, QtCore.Qt.AlignRight)
-
-            # Ensure button accepts mouse events and is clickable
-            persona_btn.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, False)
-            persona_btn.setFocusPolicy(QtCore.Qt.StrongFocus)
-            persona_btn.setAutoDefault(False)
-            persona_btn.setDefault(False)
-            persona_btn.raise_()  # Ensure button is on top
-            
-            # Connect button click to show persona menu - use direct lambda with explicit capture
-            model_id_capture = m  
-            button_capture = persona_btn  
-            persona_btn.clicked.connect(
-                lambda checked=False, mid=model_id_capture, btn=button_capture: self._show_persona_menu(mid, btn)
+        if populate_model_rows:
+            widgets = populate_model_rows(
+                layout=self.models_layout,
+                models=self.models,
+                persona_assignments=self.persona_assignments,
+                persona_names=persona_name_list,
+                personas_enabled=self.use_roles,
+                provider_name_for_model=lambda model: (
+                    provider_label(self.model_provider_map.get(model).provider_type)
+                    if self.model_provider_map.get(model)
+                    else "Unknown"
+                ),
+                meta_text_for_model=self._model_badge_text,
+                on_persona_click=self._show_persona_menu,
+                on_selection_changed=self._on_model_selection_changed,
+                ui_available=_UI_AVAILABLE,
+                model_card_class=ModelCard if _UI_AVAILABLE else None,
             )
-
-            self.models_layout.insertWidget(self.models_layout.count() - 1, row_widget)
-            self.model_checks[m] = cb
-            self.model_persona_combos[m] = persona_btn
-            self.model_meta_labels[m] = meta_label
-            self.model_rows[m] = row_widget
-            
-            # Connect model selection change to update capabilities
-            cb.toggled.connect(self._on_model_selection_changed)
+            self.model_checks = widgets.checks
+            self.model_persona_combos = widgets.persona_buttons
+            self.model_meta_labels = widgets.meta_labels
+            self.model_rows = widgets.rows
+        else:
+            while self.models_layout.count():
+                item = self.models_layout.takeAt(0)
+                if item.widget():
+                    item.widget().setParent(None)
+                del item
+            self.model_checks.clear()
+            self.model_persona_combos.clear()
+            self.model_meta_labels.clear()
+            self.model_rows.clear()
+            self.models_layout.addStretch(1)
 
         # Ensure visibility is correct after all buttons are created
         self._update_persona_combo_visibility()
@@ -3185,10 +3122,13 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
     def _filter_model_rows(self):
         query = self.model_filter_edit.text().strip().lower()
-        for model, row in self.model_rows.items():
-            badge = self.model_meta_labels.get(model)
-            haystack = f"{model} {badge.text() if badge else ''}".lower()
-            row.setVisible((not query) or (query in haystack))
+        if filter_model_rows:
+            filter_model_rows(self.model_rows, self.model_meta_labels, query)
+        else:
+            for model, row in self.model_rows.items():
+                badge = self.model_meta_labels.get(model)
+                haystack = f"{model} {badge.text() if badge else ''}".lower()
+                row.setVisible((not query) or (query in haystack))
         self._refresh_selection_summary()
 
     # ----- UI helpers -----
@@ -3761,57 +3701,12 @@ class CouncilWindow(QtWidgets.QMainWindow):
     
     def _build_persona_config(self, model: str, persona_name: str) -> Dict:
         """Build persona_config structure for an agent."""
-        # Try to match persona_name to default or user personas
-        persona_id = None
-        source = "default"
-        
-        # Check default personas
-        if DEFAULT_PERSONAS_PATH.exists():
-            try:
-                with open(DEFAULT_PERSONAS_PATH, 'r', encoding='utf-8') as f:
-                    default_personas = json.load(f)
-                    for p in default_personas:
-                        if p.get("name") == persona_name:
-                            persona_id = p.get("id")
-                            source = "default"
-                            break
-            except Exception:
-                pass
-        
-        # Check user personas if not found in defaults
-        if not persona_id and USER_PERSONAS_PATH.exists():
-            try:
-                with open(USER_PERSONAS_PATH, 'r', encoding='utf-8') as f:
-                    user_personas = json.load(f)
-                    for p in user_personas:
-                        if p.get("name") == persona_name:
-                            persona_id = p.get("id")
-                            source = "user_custom"
-                            break
-            except Exception:
-                pass
-        
-        # Fallback to legacy persona system
-        if not persona_id:
-            persona_prompt = self._persona_prompt(persona_name)
-            if persona_prompt:
-                return {
-                    "source": "one_time",
-                    "id": None,
-                    "one_time_prompt": persona_prompt
-                }
-            else:
-                return {
-                    "source": "default",
-                    "id": None,
-                    "one_time_prompt": ""
-                }
-        
-        return {
-            "source": source,
-            "id": persona_id,
-            "one_time_prompt": ""
-        }
+        if build_persona_config:
+            return build_persona_config(persona_name, self.personas)
+        persona_prompt_text = self._persona_prompt(persona_name)
+        if persona_prompt_text:
+            return {"source": "one_time", "id": None, "one_time_prompt": persona_prompt_text}
+        return {"source": "default", "id": None, "one_time_prompt": ""}
     
     def _prepare_discussion_tabs(self, selected: List[str]):
         """Prepare UI tabs for discussion mode."""
