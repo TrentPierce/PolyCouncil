@@ -12,7 +12,7 @@ import aiohttp
 
 # Try to import file parsing libraries
 try:
-    import PyPDF2
+    from pypdf import PdfReader
     PDF_AVAILABLE = True
 except ImportError:
     PDF_AVAILABLE = False
@@ -64,13 +64,13 @@ class FileParser:
     
     @staticmethod
     def _parse_pdf(file_path: Path) -> Optional[str]:
-        """Parse PDF file using PyPDF2."""
+        """Parse PDF file using pypdf."""
         if not PDF_AVAILABLE:
             return None
         try:
             text_parts = []
             with open(file_path, 'rb') as f:
-                pdf_reader = PyPDF2.PdfReader(f)
+                pdf_reader = PdfReader(f)
                 for page in pdf_reader.pages:
                     text_parts.append(page.extract_text())
             return '\n\n'.join(text_parts)

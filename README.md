@@ -75,8 +75,10 @@ This creates a more reliable, research-friendly way to:
 
 - **Provider Profiles**: Save multiple providers and load/add models from each without retyping settings
 - **Debug Log Dock**: Dockable panel for detailed analysis of the deliberation process
-- **Modern UI**: Clean, intuitive interface built with PySide6 with automatic dark/light theme support
+- **Modern UI**: Clean, intuitive interface built with PySide6 with optional automatic dark/light theming when supported by the runtime
 - **Persistent Settings**: All preferences saved automatically
+- **Session History**: Each run is saved as structured JSON for replay and export
+- **Safe Rich Text Rendering**: Model output is sanitized before display in the UI
 
 ---
 
@@ -123,7 +125,8 @@ python council.py
   - PySide6 (GUI framework)
   - aiohttp (async HTTP client)
   - requests (HTTP library)
-  - pyinstaller (build tooling)
+  - keyring (secure API key storage)
+  - bleach (safe HTML sanitization)
 
 ---
 
@@ -226,7 +229,19 @@ PolyCouncil automatically saves your preferences, including:
 - Debug mode preference
 - Single-voter settings
 
-Settings are stored in `council_settings.json` in the application directory.
+PolyCouncil now stores runtime data in platform-native user directories instead of the app folder:
+- **Settings / profiles / user personas**
+  - Windows: `%APPDATA%\PolyCouncil`
+  - macOS: `~/Library/Application Support/PolyCouncil`
+  - Linux: `${XDG_CONFIG_HOME:-~/.config}/PolyCouncil`
+- **Leaderboard database / session history**
+  - Windows: `%LOCALAPPDATA%\PolyCouncil`
+  - macOS: `~/Library/Application Support/PolyCouncil`
+  - Linux: `${XDG_DATA_HOME:-~/.local/share}/PolyCouncil`
+
+Hosted API keys are no longer written to plaintext JSON. PolyCouncil stores them in the OS keychain when available; otherwise they remain in-memory for the current session only.
+
+Session history is written as JSON under the data directory and can be replayed or exported from the UI.
 
 ---
 
@@ -270,7 +285,7 @@ Please feel free to open an issue or submit a pull request. All contributions he
 ```bash
 git clone https://github.com/TrentPierce/PolyCouncil.git
 cd PolyCouncil
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 python council.py
 ```
 

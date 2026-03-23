@@ -10,6 +10,8 @@ from typing import Dict, List, Optional, Tuple, Callable
 from pathlib import Path
 import aiohttp
 
+from core.app_state import app_config_dir
+
 PROVIDER_LM_STUDIO = "lm_studio"
 PROVIDER_OPENAI_COMPAT = "openai_compatible"
 PROVIDER_OLLAMA = "ollama"
@@ -79,6 +81,27 @@ class DiscussionManager:
         self.consensus_reached = False
         self.conversation_summary: str = ""  # Rolling summary of older conversation
         self.summarized_context: str = ""  # Summarized file context
+
+    def _active_agents(self) -> List[Dict]:
+        return [agent for agent in self.agents if agent.get("is_active", True)]
+
+    def _select_balanced_agent(self, history: List[Dict]) -> Optional[Dict]:
+        active_agents = self._active_agents()
+        if not active_agents:
+            return None
+        contribution_counts = {
+            agent.get("name", agent.get("model", "")): 0
+            for agent in active_agents
+        }
+        for entry in history:
+            contribution_counts[entry.get("agent", "")] = contribution_counts.get(entry.get("agent", ""), 0) + 1
+        return min(
+            active_agents,
+            key=lambda agent: (
+                contribution_counts.get(agent.get("name", agent.get("model", "")), 0),
+                agent.get("name", agent.get("model", "")),
+            ),
+        )
 
     def _agent_provider(self, agent: Optional[Dict] = None) -> Tuple[str, str, str, str]:
         if agent:
@@ -160,7 +183,7 @@ class DiscussionManager:
     def _load_user_persona(self, persona_id: str) -> str:
         """Load persona prompt from user_personas.json."""
         try:
-            user_path = Path(__file__).parent.parent / "config" / "user_personas.json"
+            user_path = app_config_dir() / "user_personas.json"
             if user_path.exists():
                 with open(user_path, 'r', encoding='utf-8') as f:
                     personas = json.load(f)
@@ -634,10 +657,11 @@ Summary:"""
                     # Summarize turns 1 through (current - 3)
                     older_turns = [e for e in conversation_history if e.get("turn", 0) < self.turn_count - 2]
                     if older_turns and len(older_turns) > 2:
-                        active_agents = [a for a in self.agents if a.get("is_active", True)]
+                        active_agents = self._active_agents()
                         if active_agents:
+                            summary_agent = self._select_balanced_agent(conversation_history) or active_agents[0]
                             summary = await self._generate_conversation_summary(
-                                session, older_turns, active_agents[0]
+                                session, older_turns, summary_agent
                             )
                             if summary:
                                 self.conversation_summary = summary
@@ -669,45 +693,44 @@ Summary:"""
         Heuristic to check if consensus is reached based on message content.
         Looks for convergence signals in recent messages.
         """
-        if len(history) < 3:
+        active_agents = self._active_agents()
+        if len(history) < max(4, len(active_agents) * 2):
             return False
-        
-        # Get recent messages (last 3-4 entries depending on agent count)
-        recent_messages = [e.get('message', '').lower() for e in history[-4:]]
-        
-        # Consensus/agreement indicators
-        consensus_phrases = [
-            'agree', 'consensus', 'conclude', 'in conclusion', 'summary',
-            'we have reached', 'final answer', 'to summarize', 'all things considered',
-            'the best approach', 'recommend', 'settled on', 'converge'
+
+        recent_entries = history[-max(4, len(active_agents) * 2):]
+        strong_consensus_phrases = [
+            "we agree",
+            "consensus reached",
+            "shared conclusion",
+            "joint recommendation",
+            "aligned on",
+            "we converge",
+            "our conclusion",
+            "final recommendation",
         ]
-        
-        # Disagreement indicators (if present, not yet consensus)
         disagreement_phrases = [
-            'disagree', 'however', 'on the other hand', 'but i think',
-            'counterpoint', 'alternatively', 'i would argue'
+            "disagree",
+            "counterpoint",
+            "alternatively",
+            "i object",
+            "i still differ",
+            "however, i recommend",
         ]
-        
-        # Count signals
-        consensus_signals = sum(
-            1 for msg in recent_messages 
-            for phrase in consensus_phrases 
-            if phrase in msg
-        )
-        
-        disagreement_signals = sum(
-            1 for msg in recent_messages 
-            for phrase in disagreement_phrases 
-            if phrase in msg
-        )
-        
-        # Consensus reached if:
-        # - We have multiple consensus signals and few disagreements, OR
-        # - We've reached max turns
-        if consensus_signals >= 2 and disagreement_signals <= 1:
+
+        consensus_agents = set()
+        disagreement_hits = 0
+        for entry in recent_entries:
+            msg = entry.get("message", "").lower()
+            agent_name = entry.get("agent", "")
+            if any(phrase in msg for phrase in disagreement_phrases):
+                disagreement_hits += 1
+            if any(phrase in msg for phrase in strong_consensus_phrases):
+                consensus_agents.add(agent_name)
+
+        required_agents = max(2, min(len(active_agents), 3))
+        if len(consensus_agents) >= required_agents and disagreement_hits == 0:
             return True
-        
-        # Always stop at max turns
+
         return self.turn_count >= self.max_turns
     
     async def _generate_synthesis(
@@ -721,13 +744,13 @@ Summary:"""
                 self.status_callback("Generating final synthesis...")
             
             # Use the first active agent to generate synthesis
-            active_agents = [a for a in self.agents if a.get("is_active", True)]
+            active_agents = self._active_agents()
             if not active_agents:
                 if self.status_callback:
                     self.status_callback("No active agents for synthesis generation")
                 return None
-            
-            synthesis_agent = active_agents[0]
+
+            synthesis_agent = self._select_balanced_agent(conversation_history) or active_agents[0]
             model = synthesis_agent.get("model")
             
             # Format discussion for synthesis (limit to prevent context overflow)

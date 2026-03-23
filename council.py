@@ -15,7 +15,6 @@ import re
 import random
 import uuid
 import traceback
-import markdown  # type: ignore
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, List, Callable, Awaitable, Any, Iterable, Tuple
@@ -26,11 +25,27 @@ from PySide6 import QtCore, QtGui, QtWidgets
 try:
     from core.tool_manager import FileParser, ModelCapabilityDetector
     from core.discussion_manager import DiscussionManager
+    from core.app_state import app_config_dir, app_data_dir, app_log_dir, legacy_root_dir, migrate_legacy_state
+    from core.rendering import escape_text, markdown_to_safe_html
+    from core.secure_store import get_secret, secure_store_available, set_secret
+    from core.session_history import load_session, save_session
 except ImportError:
     # Fallback if modules not found
     FileParser = None
     ModelCapabilityDetector = None
     DiscussionManager = None
+    app_config_dir = None
+    app_data_dir = None
+    app_log_dir = None
+    legacy_root_dir = None
+    migrate_legacy_state = None
+    escape_text = None
+    markdown_to_safe_html = None
+    get_secret = None
+    secure_store_available = None
+    set_secret = None
+    load_session = None
+    save_session = None
 
 # Try optional theming (follows system)
 try:
@@ -153,10 +168,19 @@ def short_id(mid: str, n: int = 28) -> str:
 # Paths / persistence
 # -----------------------
 APP_DIR = Path(__file__).resolve().parent
-DB_PATH = APP_DIR / "council_stats.db"
-SETTINGS_PATH = APP_DIR / "council_settings.json"
+LEGACY_ROOT = legacy_root_dir() if legacy_root_dir else APP_DIR
+if migrate_legacy_state:
+    migrate_legacy_state()
+CONFIG_DIR = app_config_dir() if app_config_dir else APP_DIR
+DATA_DIR = app_data_dir() if app_data_dir else APP_DIR
+LOG_DIR = app_log_dir() if app_log_dir else APP_DIR
+DB_PATH = DATA_DIR / "council_stats.db"
+SETTINGS_PATH = CONFIG_DIR / "settings.json"
 DEFAULT_PERSONAS_PATH = APP_DIR / "config" / "default_personas.json"
-USER_PERSONAS_PATH = APP_DIR / "config" / "user_personas.json"
+USER_PERSONAS_PATH = CONFIG_DIR / "user_personas.json"
+LEGACY_SETTINGS_PATH = LEGACY_ROOT / "council_settings.json"
+LEGACY_DB_PATH = LEGACY_ROOT / "council_stats.db"
+LEGACY_USER_PERSONAS_PATH = LEGACY_ROOT / "config" / "user_personas.json"
 
 PROVIDER_LM_STUDIO = "lm_studio"
 PROVIDER_OPENAI_COMPAT = "openai_compatible"
@@ -187,6 +211,8 @@ API_SERVICE_PRESETS = {
     API_SERVICE_GEMINI: {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "model_path": "models"},
 }
 
+ACTIVE_API_KEY_REF = "active-provider"
+
 
 @dataclass
 class ProviderConfig:
@@ -196,10 +222,85 @@ class ProviderConfig:
     model_path: str = ""
     api_service: str = API_SERVICE_CUSTOM
 
+def _profile_secret_name(profile_id: str) -> str:
+    return f"provider-profile::{profile_id}"
+
+
+def _persist_api_key(secret_name: str, api_key: str) -> bool:
+    if not api_key:
+        if set_secret:
+            set_secret(secret_name, "")
+        return True
+    if not set_secret:
+        return False
+    return bool(set_secret(secret_name, api_key))
+
+
+def _load_api_key(secret_name: str) -> str:
+    if not get_secret:
+        return ""
+    return get_secret(secret_name)
+
+
+def _strip_persisted_secrets(settings_data: dict) -> tuple[dict, bool]:
+    cleaned = dict(settings_data or {})
+    secure_save_ok = True
+
+    if "api_key" in cleaned:
+        secure_save_ok = _persist_api_key(ACTIVE_API_KEY_REF, str(cleaned.get("api_key", ""))) and secure_save_ok
+        cleaned.pop("api_key", None)
+
+    profiles = []
+    for profile in cleaned.get("provider_profiles", []) or []:
+        if not isinstance(profile, dict):
+            continue
+        normalized = dict(profile)
+        profile_id = str(normalized.get("id") or uuid.uuid4())
+        normalized["id"] = profile_id
+        if "api_key" in normalized:
+            secure_save_ok = _persist_api_key(_profile_secret_name(profile_id), str(normalized.get("api_key", ""))) and secure_save_ok
+            normalized.pop("api_key", None)
+        profiles.append(normalized)
+    if "provider_profiles" in cleaned:
+        cleaned["provider_profiles"] = profiles
+
+    return cleaned, secure_save_ok
+
+
+def _hydrate_secrets(settings_data: dict) -> tuple[dict, bool]:
+    hydrated = dict(settings_data or {})
+    secure_load_ok = True
+
+    active_key = _load_api_key(ACTIVE_API_KEY_REF)
+    if not active_key and settings_data.get("api_key"):
+        secure_load_ok = _persist_api_key(ACTIVE_API_KEY_REF, str(settings_data.get("api_key", ""))) and secure_load_ok
+        active_key = str(settings_data.get("api_key", ""))
+    hydrated["api_key"] = active_key
+
+    profiles = []
+    for profile in hydrated.get("provider_profiles", []) or []:
+        if not isinstance(profile, dict):
+            continue
+        normalized = dict(profile)
+        profile_id = str(normalized.get("id") or uuid.uuid4())
+        normalized["id"] = profile_id
+        profile_key = _load_api_key(_profile_secret_name(profile_id))
+        if not profile_key and profile.get("api_key"):
+            secure_load_ok = _persist_api_key(_profile_secret_name(profile_id), str(profile.get("api_key", ""))) and secure_load_ok
+            profile_key = str(profile.get("api_key", ""))
+        normalized["api_key"] = profile_key
+        profiles.append(normalized)
+    hydrated["provider_profiles"] = profiles
+    hydrated["secure_keyring_available"] = bool(secure_store_available and secure_store_available())
+    hydrated["secure_storage_ok"] = secure_load_ok
+    return hydrated, secure_load_ok
+
+
 def load_settings() -> dict:
     if SETTINGS_PATH.exists():
         try:
             loaded = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            loaded, _ = _hydrate_secrets(loaded)
             provider_type = loaded.get("provider_type", PROVIDER_LM_STUDIO)
             if provider_type == PROVIDER_OLLAMA:
                 loaded.setdefault("base_url", "http://localhost:11434")
@@ -212,7 +313,7 @@ def load_settings() -> dict:
             return loaded
         except Exception:
             pass
-    return {
+    defaults = {
         "provider_type": PROVIDER_LM_STUDIO,
         "base_url": "http://localhost:1234",
         "api_key": "",
@@ -226,6 +327,9 @@ def load_settings() -> dict:
         "personas": [],
         "persona_assignments": {},
     }
+    defaults["secure_keyring_available"] = bool(secure_store_available and secure_store_available())
+    defaults["secure_storage_ok"] = True
+    return defaults
 
 # Thread lock for settings to prevent race conditions
 _settings_lock = threading.Lock()
@@ -242,17 +346,22 @@ def save_settings(s: dict):
                     print(f"Warning: Settings file corrupted, starting fresh: {e}")
                     current = {}
             current.update(s or {})
+            current, secure_save_ok = _strip_persisted_secrets(current)
+            SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
             SETTINGS_PATH.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
+            return secure_save_ok
         except PermissionError as e:
             print(f"Error: Cannot write settings (permission denied): {e}")
         except Exception as e:
             print(f"Warning: Failed to save settings: {e}")
+    return False
 
 def log_unhandled_exception(exc_type, exc_value, exc_tb):
     try:
         ts = datetime.datetime.now().isoformat(timespec="seconds")
         tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
-        log_path = APP_DIR / "polycouncil_crash.log"
+        log_path = LOG_DIR / "polycouncil_crash.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(f"[{ts}] Unhandled exception\n{tb_text}\n", encoding="utf-8")
     except Exception:
         pass
@@ -261,6 +370,7 @@ def log_unhandled_exception(exc_type, exc_value, exc_tb):
 # Database (leaderboard)
 # -----------------------
 def ensure_db():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute("""
@@ -277,6 +387,7 @@ def ensure_db():
 
 def record_vote(question: str, winner: str, details: dict):
     try:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
         cur.execute(
@@ -530,7 +641,13 @@ async def call_model(
 # -----------------------
 # Voting schema & parsing
 # -----------------------
-RUBRIC_WEIGHTS = {"correctness": 5, "relevance": 3, "specificity": 3, "safety": 2, "conciseness": 1}
+DEFAULT_RUBRIC_WEIGHTS = {"correctness": 5, "relevance": 3, "specificity": 3, "safety": 2, "conciseness": 1}
+RUBRIC_PRESETS = {
+    "Balanced": dict(DEFAULT_RUBRIC_WEIGHTS),
+    "Accuracy First": {"correctness": 6, "relevance": 3, "specificity": 3, "safety": 2, "conciseness": 1},
+    "Safety First": {"correctness": 4, "relevance": 2, "specificity": 2, "safety": 5, "conciseness": 1},
+    "Concise": {"correctness": 4, "relevance": 3, "specificity": 2, "safety": 2, "conciseness": 3},
+}
 
 VOTE_INSTRUCTIONS = """\
 You are voting on the BEST answer to the user's question from several model candidates.
@@ -632,6 +749,19 @@ def validate_ballot(idx_map_peer: Dict[int, str], ballot: dict) -> Tuple[bool, s
     except Exception as e:
         return False, f"exception {e}"
 
+
+def normalize_rubric_weights(weights: Optional[Dict[str, Any]]) -> Dict[str, int]:
+    normalized = dict(DEFAULT_RUBRIC_WEIGHTS)
+    if not isinstance(weights, dict):
+        return normalized
+    for key, default_value in DEFAULT_RUBRIC_WEIGHTS.items():
+        value = weights.get(key, default_value)
+        try:
+            normalized[key] = max(0, int(value))
+        except Exception:
+            normalized[key] = default_value
+    return normalized
+
 # -----------------------
 # Voting worker
 # -----------------------
@@ -724,21 +854,24 @@ async def council_round(
     images: Optional[List[str]] = None,
     web_search: bool = False,
     temperature: float = 0.7,
+    rubric_weights: Optional[Dict[str, int]] = None,
     is_cancelled: Optional[Callable[[], bool]] = None
 ):
     status_cb("Collecting answers…")
     async with aiohttp.ClientSession() as session:
+        weights = normalize_rubric_weights(rubric_weights)
 
         images = images or []
-        async def answer_one(entry: Dict[str, Any]) -> tuple[str, str]:
+        async def answer_one(entry: Dict[str, Any]) -> tuple[str, str, int]:
             model_id = str(entry["id"])
             raw_model = str(entry["model"])
             provider = entry["provider"]
             if is_cancelled and is_cancelled():
-                return model_id, "[Cancelled]"
+                return model_id, "[Cancelled]", 0
             
             user_prompt = question
             sys_p = roles.get(model_id) or None
+            started_at = datetime.datetime.now()
             try:
                 ans = await call_model(
                     session, provider, raw_model, user_prompt,
@@ -747,9 +880,11 @@ async def council_round(
                 )
                 if isinstance(ans, dict):
                     ans = json.dumps(ans, ensure_ascii=False)
-                return model_id, ans
+                elapsed_ms = int((datetime.datetime.now() - started_at).total_seconds() * 1000)
+                return model_id, ans, elapsed_ms
             except Exception as e1:
-                return model_id, f"[ERROR fetching answer]\n{e1}"
+                elapsed_ms = int((datetime.datetime.now() - started_at).total_seconds() * 1000)
+                return model_id, f"[ERROR fetching answer]\n{e1}", elapsed_ms
 
         # Check cancellation before starting
         if is_cancelled and is_cancelled():
@@ -761,8 +896,9 @@ async def council_round(
         if is_cancelled and is_cancelled():
             raise RuntimeError("Process cancelled by user")
             
-        answers = {m: a for m, a in pairs}
-        errors = {m: a for m, a in pairs if isinstance(a, str) and a.startswith("[ERROR")}
+        answers = {m: a for m, a, _ in pairs}
+        timings_ms = {m: elapsed for m, _, elapsed in pairs}
+        errors = {m: a for m, a, _ in pairs if isinstance(a, str) and a.startswith("[ERROR")}
 
         status_cb("Models are voting…")
 
@@ -795,7 +931,7 @@ async def council_round(
         totals: Dict[str, int] = {mid: 0 for mid in selected_model_ids}
         for ballot in valid_votes.values():
             for candidate_mid, score_dict in ballot["scores"].items():
-                weighted = sum(score_dict[k] * RUBRIC_WEIGHTS[k] for k in RUBRIC_WEIGHTS.keys())
+                weighted = sum(score_dict[k] * weights[k] for k in weights.keys())
                 totals[candidate_mid] = totals.get(candidate_mid, 0) + int(weighted)
 
         if not valid_votes:
@@ -820,6 +956,8 @@ async def council_round(
             "vote_messages": vote_messages,
             "tally": tally,
             "errors": errors,
+            "timings_ms": timings_ms,
+            "rubric_weights": weights,
             "winner": winner,
             "participation_rate": len(valid_votes) / max(1, len(voters_to_use)),
             "voters_used": voters_to_use,
@@ -891,6 +1029,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.last_submitted_question = ""
         self.provider_profiles: List[Dict[str, str]] = []
         self.provider_profile_rows: Dict[str, QtWidgets.QWidget] = {}
+        self.last_session_record: Optional[Dict[str, Any]] = None
+        self.model_meta_labels: Dict[str, QtWidgets.QLabel] = {}
         
         # New features
         self.mode = "deliberation"  # "deliberation" or "discussion"
@@ -907,10 +1047,13 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
         # restore settings
         s = load_settings()
+        self.secure_keyring_available = bool(s.get("secure_keyring_available", False))
+        self.secure_storage_ok = bool(s.get("secure_storage_ok", True))
         self.provider_type = normalize_provider_type(s.get("provider_type", PROVIDER_LM_STUDIO))
         self.api_key = s.get("api_key", "") or ""
         self.model_path = s.get("model_path", "") or ""
         self.api_service = normalize_api_service(s.get("api_service", API_SERVICE_CUSTOM))
+        self.rubric_weights = normalize_rubric_weights(s.get("rubric_weights"))
         default_base, _ = provider_defaults(self.provider_type)
         self.base_edit.setText(s.get("base_url", default_base))
         self.api_key_inline.setText(self.api_key)
@@ -968,6 +1111,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
         # initial connect
         QtCore.QTimer.singleShot(50, self._connect_base)
         self._refresh_leaderboard()
+        if not self.secure_keyring_available:
+            self._set_status("Secure keychain unavailable. Hosted API keys will only persist for the current session.")
 
     # ----- UI -----
     def _build_ui(self):
@@ -1243,11 +1388,18 @@ class CouncilWindow(QtWidgets.QMainWindow):
         right = QtWidgets.QVBoxLayout()
         right.setSpacing(8)
 
+        right_header = QtWidgets.QHBoxLayout()
         self.tabs_title = QtWidgets.QLabel("Per-Model Answers")
         self.tabs_title.setStyleSheet("font-weight: 600;")
+        self.replay_last_btn = QtWidgets.QPushButton("Replay Last")
+        self.export_json_btn = QtWidgets.QPushButton("Export JSON")
+        right_header.addWidget(self.tabs_title)
+        right_header.addStretch(1)
+        right_header.addWidget(self.replay_last_btn)
+        right_header.addWidget(self.export_json_btn)
         self.tabs = QtWidgets.QTabWidget()
 
-        right.addWidget(self.tabs_title)
+        right.addLayout(right_header)
         right.addWidget(self.tabs, stretch=1)
 
         right_widget = QtWidgets.QWidget()
@@ -1304,6 +1456,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.stop_btn.clicked.connect(self._stop_process)
         self.conc_spin.valueChanged.connect(self._concurrency_changed)
         self.settings_btn.clicked.connect(self._open_settings_dialog)
+        self.replay_last_btn.clicked.connect(self._replay_last_session)
+        self.export_json_btn.clicked.connect(self._export_session_json)
         
         # New signal connections
         self.mode_combo.currentIndexChanged.connect(self._mode_changed)
@@ -1439,7 +1593,9 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
     def _api_key_changed(self):
         self.api_key = self.api_key_inline.text().strip()
-        save_settings({"api_key": self.api_key})
+        persisted = save_settings({"api_key": self.api_key})
+        if self.api_key and not persisted:
+            self._set_status("API key updated for this session. Install/configure a secure keychain backend to persist it.")
 
     def _update_provider_ui(self):
         hosted = self.provider_type == PROVIDER_OPENAI_COMPAT
@@ -1826,6 +1982,32 @@ class CouncilWindow(QtWidgets.QMainWindow):
         provider_hint.setStyleSheet("color: #666;")
         layout.addWidget(provider_hint)
 
+        rubric_group = QtWidgets.QGroupBox("Voting Rubric")
+        rubric_layout = QtWidgets.QVBoxLayout(rubric_group)
+        rubric_layout.setSpacing(8)
+
+        rubric_preset_row = QtWidgets.QHBoxLayout()
+        rubric_preset_row.addWidget(QtWidgets.QLabel("Preset:"))
+        rubric_preset_combo = QtWidgets.QComboBox()
+        rubric_preset_combo.addItems(list(RUBRIC_PRESETS.keys()) + ["Custom"])
+        rubric_preset_row.addWidget(rubric_preset_combo)
+        rubric_preset_row.addStretch(1)
+        rubric_layout.addLayout(rubric_preset_row)
+
+        rubric_spinboxes: Dict[str, QtWidgets.QSpinBox] = {}
+        current_weights = normalize_rubric_weights(self.rubric_weights)
+        for key in DEFAULT_RUBRIC_WEIGHTS.keys():
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(QtWidgets.QLabel(key.capitalize()))
+            spin = QtWidgets.QSpinBox()
+            spin.setRange(0, 10)
+            spin.setValue(current_weights[key])
+            row.addWidget(spin)
+            row.addStretch(1)
+            rubric_spinboxes[key] = spin
+            rubric_layout.addLayout(row)
+        layout.addWidget(rubric_group)
+
         # Persona management section
         persona_group = QtWidgets.QGroupBox("Persona Management")
         persona_layout = QtWidgets.QVBoxLayout(persona_group)
@@ -1879,6 +2061,40 @@ class CouncilWindow(QtWidgets.QMainWindow):
         
         enable_personas_checkbox.toggled.connect(on_personas_toggled)
         buttons.rejected.connect(dialog.reject)
+
+        def update_preset_selection():
+            for preset_name, preset_weights in RUBRIC_PRESETS.items():
+                if normalize_rubric_weights(preset_weights) == {
+                    key: rubric_spinboxes[key].value() for key in DEFAULT_RUBRIC_WEIGHTS.keys()
+                }:
+                    rubric_preset_combo.blockSignals(True)
+                    rubric_preset_combo.setCurrentText(preset_name)
+                    rubric_preset_combo.blockSignals(False)
+                    return
+            rubric_preset_combo.blockSignals(True)
+            rubric_preset_combo.setCurrentText("Custom")
+            rubric_preset_combo.blockSignals(False)
+
+        def save_rubric_settings():
+            self.rubric_weights = {
+                key: spin.value() for key, spin in rubric_spinboxes.items()
+            }
+            save_settings({"rubric_weights": self.rubric_weights})
+
+        def on_preset_changed(name: str):
+            if name == "Custom":
+                return
+            preset = normalize_rubric_weights(RUBRIC_PRESETS.get(name, DEFAULT_RUBRIC_WEIGHTS))
+            for key, spin in rubric_spinboxes.items():
+                spin.blockSignals(True)
+                spin.setValue(preset[key])
+                spin.blockSignals(False)
+            save_rubric_settings()
+
+        rubric_preset_combo.currentTextChanged.connect(on_preset_changed)
+        for spin in rubric_spinboxes.values():
+            spin.valueChanged.connect(lambda _value: (update_preset_selection(), save_rubric_settings()))
+        update_preset_selection()
 
         def refresh_persona_list():
             persona_list.clear()
@@ -2237,7 +2453,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
                                 "visual": any(k in raw_model.lower() for k in ["vision", "vl", "llava"]),
                             }
                         else:
-                            cache_key = f"{provider.provider_type}|{provider.base_url}|{provider.model_path}|{provider.api_key[:8]}"
+                            cache_key = f"{provider.provider_type}|{provider.base_url}|{provider.model_path}|{provider.api_service}|{bool(provider.api_key)}"
                             if cache_key not in model_data_cache:
                                 model_data_cache[cache_key] = await ModelCapabilityDetector.fetch_models_data(
                                     session, provider.base_url, provider.api_key, provider.model_path
@@ -2316,12 +2532,32 @@ class CouncilWindow(QtWidgets.QMainWindow):
         
         # Update file upload button based on visual support
         self._update_file_upload_capabilities(has_visual)
+        for model, label in self.model_meta_labels.items():
+            label.setText(self._model_badge_text(model))
 
     def _models_fetch_failed(self, error: str):
         self._model_thread = None
         self._model_worker = None
         self._busy(False)
         self._set_status(f"Model refresh failed: {error}")
+
+    def _model_badge_text(self, model: str) -> str:
+        provider = self.model_provider_map.get(model)
+        provider_badge = self._provider_tag(provider) if provider else "Unknown"
+        caps = self.model_capabilities.get(model, {})
+        cap_parts = []
+        if caps.get("visual"):
+            cap_parts.append("vision")
+        if caps.get("web_search"):
+            cap_parts.append("web")
+        session_timings = (self.last_session_record or {}).get("timings_ms", {}) or {}
+        latency_ms = session_timings.get(model)
+        details = [provider_badge]
+        if cap_parts:
+            details.append(", ".join(cap_parts))
+        if isinstance(latency_ms, (int, float)):
+            details.append(f"{int(latency_ms)} ms")
+        return " | ".join(details)
 
     def _populate_models(self):
         # clear UI - remove ALL items including stretches
@@ -2335,6 +2571,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
             del item
         self.model_checks.clear()
         self.model_persona_combos.clear()
+        self.model_meta_labels.clear()
         # Add stretch at the end
         self.models_layout.addStretch(1)
 
@@ -2398,12 +2635,20 @@ class CouncilWindow(QtWidgets.QMainWindow):
             
             # Add widgets to layout - checkbox gets remaining space, button gets fixed width
             row_layout.addWidget(cb, stretch=1)
+
+            meta_label = QtWidgets.QLabel(self._model_badge_text(m))
+            meta_label.setStyleSheet("color: #666; font-size: 10px;")
+            meta_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            meta_label.setMinimumWidth(170)
+            row_layout.addWidget(meta_label, stretch=0)
+
             row_layout.addWidget(persona_btn, stretch=0)
             row_layout.setAlignment(persona_btn, QtCore.Qt.AlignRight)
 
             self.models_layout.insertWidget(self.models_layout.count() - 1, row_widget)
             self.model_checks[m] = cb
             self.model_persona_combos[m] = persona_btn  # Store button instead of combo
+            self.model_meta_labels[m] = meta_label
             
             # Connect model selection change to update capabilities
             cb.toggled.connect(self._on_model_selection_changed)
@@ -2484,39 +2729,36 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.model_texts["_RESULTS_"].setPlainText("")
 
     def _append_chat(self, text: str):
-        # Convert simple text to HTML/Markdown for QTextBrowser
         if not text:
             return
-        
-        # Simple styling
+
         style = "margin: 5px; padding: 8px; border-radius: 8px;"
-        
+        header = ""
+
         if text.startswith("You:"):
-            # User bubble: Aligned right (simulated), distinct color
             style += "background-color: #e6f3ff; color: #000000;"
-            formatted_text = text.replace("You:", "<b>You:</b>")
+            header = "You"
+            body = text[len("You:"):].strip()
         elif "→" in text:
-            # System/Council bubble
             style += "background-color: #f0f0f0; color: #000000;"
             parts = text.split(":", 1)
-            if len(parts) == 2:
-                formatted_text = f"<b>{parts[0]}:</b>{parts[1]}"
-            else:
-                formatted_text = text
-        elif text.startswith("<i>"):
-            # Info message
+            header = parts[0].strip()
+            body = parts[1].strip() if len(parts) == 2 else text
+        elif text.startswith("<i>") and text.endswith("</i>"):
             style += "background-color: transparent; color: #666666;"
-            formatted_text = text
+            body = text[3:-4].strip()
+            body_html = f"<p><em>{escape_text(body) if escape_text else body}</em></p>"
         else:
-            # Generic
             style += "background-color: #ffffff; border: 1px solid #ddd; color: #000000;"
-            formatted_text = text
-            
-        # Convert content to markdown (excluding the headers if possible, but mixed is tricky)
-        # We will just markdown the message part if we split it, but for simplicity:
-        html_content = markdown.markdown(formatted_text)
-        
-        full_html = f"<div style='{style}'>{html_content}</div>"
+            body = text.strip()
+
+        if not (text.startswith("<i>") and text.endswith("</i>")):
+            body_html = markdown_to_safe_html(body) if markdown_to_safe_html else body
+            if header:
+                safe_header = escape_text(header) if escape_text else header
+                body_html = f"<p><strong>{safe_header}:</strong></p>{body_html}"
+
+        full_html = f"<div style='{style}'>{body_html}</div>"
         self.chat_view.append(full_html)
         self.chat_view.verticalScrollBar().setValue(self.chat_view.verticalScrollBar().maximum())
 
@@ -2787,6 +3029,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
                         model_entries, question, roles_map, self.status_signal.emit,
                         max_concurrency=conc, voter_override=voters,
                         images=images, web_search=web_search, temperature=temp,
+                        rubric_weights=self.rubric_weights,
                         is_cancelled=lambda: self._stop_requested
                     )
                 )
@@ -2996,16 +3239,17 @@ class CouncilWindow(QtWidgets.QMainWindow):
         turn = entry.get("turn", 0)
         
         # Include persona label if available
+        safe_agent = escape_text(agent) if escape_text else agent
+        safe_persona = escape_text(persona) if persona and escape_text else persona
         if persona:
-            agent_label = f"{agent} <span style='color: #666; font-size: 0.9em;'>[{persona}]</span>"
+            agent_label = f"{safe_agent} <span style='color: #666; font-size: 0.9em;'>[{safe_persona}]</span>"
         else:
-            agent_label = agent
+            agent_label = safe_agent
         
         # Style for discussion bubbles
         style = "margin: 5px 0; padding: 10px; border-radius: 8px; background-color: #f9f9f9; border: 1px solid #eee; color: #000000;"
         
-        # Convert message to markdown
-        msg_html = markdown.markdown(message)
+        msg_html = markdown_to_safe_html(message) if markdown_to_safe_html else message
         
         new_html = f"""
         <div style="{style}">
@@ -3092,7 +3336,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
                 continue
             # If it's a QPlainTextEdit (legacy tabs), update text. If QTextBrowser, use setHtml
             if isinstance(txtw, QtWidgets.QTextBrowser):
-                html = markdown.markdown(answers.get(mid, ""))
+                html = markdown_to_safe_html(answers.get(mid, "")) if markdown_to_safe_html else answers.get(mid, "")
                 txtw.setHtml(html)
             else:
                 txtw.setPlainText(answers.get(mid, ""))
@@ -3105,10 +3349,19 @@ class CouncilWindow(QtWidgets.QMainWindow):
         invalid_votes = details.get("invalid_votes", {})
         vote_messages = details.get("vote_messages", {})
         voters_used = details.get("voters_used", [])
+        timings_ms = details.get("timings_ms", {})
+        rubric_weights = normalize_rubric_weights(details.get("rubric_weights"))
 
         lines = []
         lines.append(f"Winner: {short_id(winner)}  (score={tally.get(winner, 0)})")
         lines.append("")
+        lines.append(f"Rubric Weights: {rubric_weights}")
+        lines.append("")
+        if timings_ms:
+            lines.append("Answer Latencies:")
+            for model_id in sorted(timings_ms.keys(), key=lambda mid: (timings_ms[mid], mid)):
+                lines.append(f"  {short_id(model_id):28} -> {timings_ms[model_id]} ms")
+            lines.append("")
         lines.append("Totals:")
         for m in sorted(tally.keys(), key=lambda k: (-tally[k], k)):
             lines.append(f"  {short_id(m):28} → {tally[m]}")
@@ -3125,7 +3378,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
                 for voter, ballot in valid_votes.items():
                     sc = ballot["scores"].get(candidate)
                     if sc:
-                        weighted = sum(sc[k] * RUBRIC_WEIGHTS[k] for k in RUBRIC_WEIGHTS.keys())
+                        weighted = sum(sc[k] * rubric_weights[k] for k in rubric_weights.keys())
                         received.append(f"{short_id(voter)}: {sc} → {weighted}")
                 if received:
                     lines.append(f"- {short_id(candidate)}:\n  " + "\n  ".join(received))
@@ -3138,11 +3391,29 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
         # Results tab is QPlainTextEdit, not QTextBrowser, so use setPlainText
         self.model_texts["_RESULTS_"].setPlainText("\n".join(lines))
+        self.last_session_record = {
+            "mode": "deliberation",
+            "question": question,
+            "answers": answers,
+            "winner": winner,
+            "details": details,
+            "tally": tally,
+            "timings_ms": timings_ms,
+        }
+        for model, label in self.model_meta_labels.items():
+            label.setText(self._model_badge_text(model))
+        if save_session:
+            try:
+                session_path = save_session(self.last_session_record)
+                self._set_status(f"Done. Session saved to {session_path.name}.")
+            except Exception:
+                self._set_status("Done.")
+        else:
+            self._set_status("Done.")
 
         # Show winning answer in chat
         ans = answers.get(winner, "")
         self._append_chat(f"Council → {short_id(winner)}:\n{ans}")
-        self._set_status("Done.")
     
     def _handle_discussion_result(self, payload: object):
         """Handle result from Collaborative Discussion Mode."""
@@ -3205,8 +3476,73 @@ Question: {question}
             self._append_chat(f"Final Synthesis:\n{synthesis}")
         elif synthesis is None:
             self._append_chat("Note: Synthesis generation failed. Check console for details.")
-        
-        self._set_status("Discussion complete.")
+        self.last_session_record = {
+            "mode": "discussion",
+            "question": question,
+            "transcript": transcript,
+            "synthesis": synthesis,
+            "timings_ms": {},
+        }
+        if save_session:
+            try:
+                session_path = save_session(self.last_session_record)
+                self._set_status(f"Discussion complete. Session saved to {session_path.name}.")
+            except Exception:
+                self._set_status("Discussion complete.")
+        else:
+            self._set_status("Discussion complete.")
+
+    def _replay_last_session(self):
+        if not load_session:
+            self._set_status("Session history is unavailable in this build.")
+            return
+        try:
+            record = load_session()
+        except Exception as exc:
+            self._set_status(f"Failed to load session history: {exc}")
+            return
+        if not record:
+            self._set_status("No saved session history found.")
+            return
+        self.last_session_record = record
+        if record.get("mode") == "discussion":
+            self.mode_combo.setCurrentIndex(1)
+            self._prepare_discussion_tabs(self.models)
+            self._handle_discussion_result(("discussion", record.get("question", ""), record.get("transcript", []), record.get("synthesis")))
+        else:
+            self.mode_combo.setCurrentIndex(0)
+            answers = record.get("answers", {}) or {}
+            selected_models = [mid for mid in answers.keys() if mid in self.model_checks]
+            if selected_models:
+                self._prepare_tabs(selected_models)
+            self._handle_deliberation_result((
+                record.get("question", ""),
+                answers,
+                record.get("winner", ""),
+                record.get("details", {}) or {},
+                record.get("tally", {}) or {},
+            ))
+
+    def _export_session_json(self):
+        if not self.last_session_record:
+            self._set_status("No session data available to export.")
+            return
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Session JSON",
+            "polycouncil-session.json",
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not file_path:
+            return
+        try:
+            Path(file_path).write_text(
+                json.dumps(self.last_session_record, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            self._set_status(f"Session exported to {Path(file_path).name}")
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(self, "Export Error", f"Failed to export session JSON: {exc}")
 
     def closeEvent(self, event: QtGui.QCloseEvent):
         try:
@@ -3222,6 +3558,7 @@ Question: {question}
                 "single_voter_model": self.single_voter_combo.currentText().strip(),
                 "max_concurrency": int(self.conc_spin.value()),
                 "roles_enabled": bool(self.use_roles),
+                "rubric_weights": self.rubric_weights,
             })
         except Exception:
             pass
