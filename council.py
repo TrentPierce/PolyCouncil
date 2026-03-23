@@ -2097,7 +2097,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
         detail_html = f"""
         <div style="font-size:20px; font-weight:700; margin-bottom:6px;">{esc(short_id(model_id))}</div>
         <div style="margin-bottom:10px; color:{self._palette_hex(QtGui.QPalette.Mid)};">{esc(provider_text)}</div>
-        <div style="margin-bottom:16px;"><strong>Score:</strong> {esc(score)}<br><strong>Persona:</strong> {esc(persona)}</div>
+        <div style="margin-bottom:16px;"><strong>Score:</strong> {esc(str(score))}<br><strong>Persona:</strong> {esc(persona)}</div>
         {self._safe_markdown_html(answer or "_No response returned._")}
         """
         self.selected_model_detail_view.setHtml(detail_html)
@@ -4250,7 +4250,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
         if tally:
             sections.append("<div style='font-weight:700; margin-bottom:6px;'>Totals</div>")
             sections.append("<ul style='margin-top:0; margin-bottom:16px;'>" + "".join(
-                f"<li><strong>{esc(short_id(model_id))}</strong> · {esc(tally[model_id])}</li>"
+                f"<li><strong>{esc(short_id(model_id))}</strong> · {esc(str(tally[model_id]))}</li>"
                 for model_id in sorted(tally.keys(), key=lambda key: (-tally[key], key))
             ) + "</ul>")
         if valid_votes:
