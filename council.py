@@ -1,12 +1,11 @@
 
 # council_gui_qt.py
 # GUI: PySide6 (Qt widgets)
-# Deps: PySide6, aiohttp, requests
+# Deps: PySide6, aiohttp
 # Optional: qdarktheme (auto dark/light), lmstudio (local-only "loaded models" detection)
 
 import asyncio
 import aiohttp
-import requests
 import sqlite3
 import datetime
 import json
@@ -15,7 +14,6 @@ import re
 import random
 import uuid
 import traceback
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, List, Callable, Awaitable, Any, Iterable, Tuple
 
@@ -24,16 +22,62 @@ from PySide6 import QtCore, QtGui, QtWidgets
 # Import new core modules
 try:
     from core.tool_manager import FileParser, ModelCapabilityDetector
+    from core.api_client import ModelFetchError, call_model, fetch_models
     from core.discussion_manager import DiscussionManager
+    from core import result_presenter
+    from core.provider_config import (
+        API_SERVICE_CUSTOM,
+        API_SERVICE_GEMINI,
+        API_SERVICE_LABELS,
+        API_SERVICE_OPENAI,
+        API_SERVICE_OPENROUTER,
+        PROVIDER_LABELS,
+        PROVIDER_LM_STUDIO,
+        PROVIDER_OLLAMA,
+        PROVIDER_OPENAI_COMPAT,
+        ProviderConfig,
+        api_service_label,
+        canonicalize_base_url,
+        make_provider_config,
+        normalize_api_service,
+        normalize_provider_type,
+        provider_defaults,
+        provider_label,
+        service_preset,
+    )
+    from core.settings_store import load_settings, save_settings
     from core.app_state import app_config_dir, app_data_dir, app_log_dir, legacy_root_dir, migrate_legacy_state
     from core.rendering import escape_text, markdown_to_safe_html
-    from core.secure_store import get_secret, secure_store_available, set_secret
     from core.session_history import load_session, save_session
 except ImportError:
     # Fallback if modules not found
     FileParser = None
     ModelCapabilityDetector = None
+    ModelFetchError = None
+    call_model = None
+    fetch_models = None
     DiscussionManager = None
+    result_presenter = None
+    API_SERVICE_CUSTOM = "custom"
+    API_SERVICE_OPENAI = "openai"
+    API_SERVICE_OPENROUTER = "openrouter"
+    API_SERVICE_GEMINI = "gemini"
+    API_SERVICE_LABELS = {}
+    PROVIDER_LM_STUDIO = "lm_studio"
+    PROVIDER_OPENAI_COMPAT = "openai_compatible"
+    PROVIDER_OLLAMA = "ollama"
+    PROVIDER_LABELS = {}
+    ProviderConfig = None
+    api_service_label = None
+    canonicalize_base_url = None
+    make_provider_config = None
+    normalize_api_service = None
+    normalize_provider_type = None
+    provider_defaults = None
+    provider_label = None
+    service_preset = None
+    load_settings = None
+    save_settings = None
     app_config_dir = None
     app_data_dir = None
     app_log_dir = None
@@ -41,9 +85,6 @@ except ImportError:
     migrate_legacy_state = None
     escape_text = None
     markdown_to_safe_html = None
-    get_secret = None
-    secure_store_available = None
-    set_secret = None
     load_session = None
     save_session = None
 
@@ -69,6 +110,13 @@ try:
     _UI_AVAILABLE = True
 except ImportError:
     _UI_AVAILABLE = False
+
+try:
+    from gui import build_provider_profile_row, build_workspace_panel, clear_layout
+except ImportError:
+    build_provider_profile_row = None
+    build_workspace_panel = None
+    clear_layout = None
 
 # -----------------------
 # Debug logging switches
@@ -296,191 +344,8 @@ CONFIG_DIR = app_config_dir() if app_config_dir else APP_DIR
 DATA_DIR = app_data_dir() if app_data_dir else APP_DIR
 LOG_DIR = app_log_dir() if app_log_dir else APP_DIR
 DB_PATH = DATA_DIR / "council_stats.db"
-SETTINGS_PATH = CONFIG_DIR / "settings.json"
 DEFAULT_PERSONAS_PATH = APP_DIR / "config" / "default_personas.json"
 USER_PERSONAS_PATH = CONFIG_DIR / "user_personas.json"
-LEGACY_SETTINGS_PATH = LEGACY_ROOT / "council_settings.json"
-LEGACY_DB_PATH = LEGACY_ROOT / "council_stats.db"
-LEGACY_USER_PERSONAS_PATH = LEGACY_ROOT / "config" / "user_personas.json"
-
-PROVIDER_LM_STUDIO = "lm_studio"
-PROVIDER_OPENAI_COMPAT = "openai_compatible"
-PROVIDER_OLLAMA = "ollama"
-
-PROVIDER_LABELS = {
-    PROVIDER_LM_STUDIO: "LM Studio (OpenAI-compatible)",
-    PROVIDER_OPENAI_COMPAT: "OpenAI-compatible API",
-    PROVIDER_OLLAMA: "Ollama",
-}
-
-API_SERVICE_CUSTOM = "custom"
-API_SERVICE_OPENAI = "openai"
-API_SERVICE_OPENROUTER = "openrouter"
-API_SERVICE_GEMINI = "gemini"
-
-API_SERVICE_LABELS = {
-    API_SERVICE_CUSTOM: "Custom",
-    API_SERVICE_OPENAI: "OpenAI",
-    API_SERVICE_OPENROUTER: "OpenRouter",
-    API_SERVICE_GEMINI: "Google Gemini",
-}
-
-API_SERVICE_PRESETS = {
-    API_SERVICE_CUSTOM: {"base_url": "", "model_path": ""},
-    API_SERVICE_OPENAI: {"base_url": "https://api.openai.com", "model_path": "v1/models"},
-    API_SERVICE_OPENROUTER: {"base_url": "https://openrouter.ai/api/v1", "model_path": "models"},
-    API_SERVICE_GEMINI: {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "model_path": "models"},
-}
-
-ACTIVE_API_KEY_REF = "active-provider"
-
-
-@dataclass
-class ProviderConfig:
-    provider_type: str
-    base_url: str
-    api_key: str = ""
-    model_path: str = ""
-    api_service: str = API_SERVICE_CUSTOM
-
-
-class ModelFetchError(RuntimeError):
-    pass
-
-def _profile_secret_name(profile_id: str) -> str:
-    return f"provider-profile::{profile_id}"
-
-
-def _persist_api_key(secret_name: str, api_key: str) -> bool:
-    if not api_key:
-        if set_secret:
-            set_secret(secret_name, "")
-        return True
-    if not set_secret:
-        return False
-    return bool(set_secret(secret_name, api_key))
-
-
-def _load_api_key(secret_name: str) -> str:
-    if not get_secret:
-        return ""
-    return get_secret(secret_name)
-
-
-def _strip_persisted_secrets(settings_data: dict) -> tuple[dict, bool]:
-    cleaned = dict(settings_data or {})
-    secure_save_ok = True
-
-    if "api_key" in cleaned:
-        secure_save_ok = _persist_api_key(ACTIVE_API_KEY_REF, str(cleaned.get("api_key", ""))) and secure_save_ok
-        cleaned.pop("api_key", None)
-
-    profiles = []
-    for profile in cleaned.get("provider_profiles", []) or []:
-        if not isinstance(profile, dict):
-            continue
-        normalized = dict(profile)
-        profile_id = str(normalized.get("id") or uuid.uuid4())
-        normalized["id"] = profile_id
-        if "api_key" in normalized:
-            secure_save_ok = _persist_api_key(_profile_secret_name(profile_id), str(normalized.get("api_key", ""))) and secure_save_ok
-            normalized.pop("api_key", None)
-        profiles.append(normalized)
-    if "provider_profiles" in cleaned:
-        cleaned["provider_profiles"] = profiles
-
-    return cleaned, secure_save_ok
-
-
-def _hydrate_secrets(settings_data: dict) -> tuple[dict, bool]:
-    hydrated = dict(settings_data or {})
-    secure_load_ok = True
-
-    active_key = _load_api_key(ACTIVE_API_KEY_REF)
-    if not active_key and settings_data.get("api_key"):
-        secure_load_ok = _persist_api_key(ACTIVE_API_KEY_REF, str(settings_data.get("api_key", ""))) and secure_load_ok
-        active_key = str(settings_data.get("api_key", ""))
-    hydrated["api_key"] = active_key
-
-    profiles = []
-    for profile in hydrated.get("provider_profiles", []) or []:
-        if not isinstance(profile, dict):
-            continue
-        normalized = dict(profile)
-        profile_id = str(normalized.get("id") or uuid.uuid4())
-        normalized["id"] = profile_id
-        profile_key = _load_api_key(_profile_secret_name(profile_id))
-        if not profile_key and profile.get("api_key"):
-            secure_load_ok = _persist_api_key(_profile_secret_name(profile_id), str(profile.get("api_key", ""))) and secure_load_ok
-            profile_key = str(profile.get("api_key", ""))
-        normalized["api_key"] = profile_key
-        profiles.append(normalized)
-    hydrated["provider_profiles"] = profiles
-    hydrated["secure_keyring_available"] = bool(secure_store_available and secure_store_available())
-    hydrated["secure_storage_ok"] = secure_load_ok
-    return hydrated, secure_load_ok
-
-
-def load_settings() -> dict:
-    if SETTINGS_PATH.exists():
-        try:
-            loaded = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-            loaded, _ = _hydrate_secrets(loaded)
-            provider_type = loaded.get("provider_type", PROVIDER_LM_STUDIO)
-            if provider_type == PROVIDER_OLLAMA:
-                loaded.setdefault("base_url", "http://localhost:11434")
-            else:
-                loaded.setdefault("base_url", "http://localhost:1234")
-            loaded.setdefault("provider_type", provider_type)
-            loaded.setdefault("api_key", "")
-            loaded.setdefault("model_path", "")
-            loaded.setdefault("api_service", API_SERVICE_CUSTOM)
-            return loaded
-        except Exception:
-            pass
-    defaults = {
-        "provider_type": PROVIDER_LM_STUDIO,
-        "base_url": "http://localhost:1234",
-        "api_key": "",
-        "model_path": "",
-        "api_service": API_SERVICE_CUSTOM,
-        "debug": False,
-        "single_voter_enabled": False,
-        "single_voter_model": "",
-        "max_concurrency": 1,
-        "roles_enabled": False,
-        "personas": [],
-        "persona_assignments": {},
-    }
-    defaults["secure_keyring_available"] = bool(secure_store_available and secure_store_available())
-    defaults["secure_storage_ok"] = True
-    return defaults
-
-# Thread lock for settings to prevent race conditions
-_settings_lock = threading.Lock()
-
-def save_settings(s: dict):
-    """Thread-safe settings persistence with proper error handling."""
-    with _settings_lock:
-        try:
-            current = {}
-            if SETTINGS_PATH.exists():
-                try:
-                    current = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-                except json.JSONDecodeError as e:
-                    print(f"Warning: Settings file corrupted, starting fresh: {e}")
-                    current = {}
-            current.update(s or {})
-            current, secure_save_ok = _strip_persisted_secrets(current)
-            SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            SETTINGS_PATH.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
-            return secure_save_ok
-        except PermissionError as e:
-            print(f"Error: Cannot write settings (permission denied): {e}")
-        except Exception as e:
-            print(f"Warning: Failed to save settings: {e}")
-    return False
-
 def log_unhandled_exception(exc_type, exc_value, exc_tb):
     try:
         ts = datetime.datetime.now().isoformat(timespec="seconds")
@@ -535,175 +400,6 @@ def load_leaderboard() -> List[tuple[str, int]]:
         return []
 
 # -----------------------
-# Provider helpers
-# -----------------------
-def provider_label(provider_type: str) -> str:
-    return PROVIDER_LABELS.get(provider_type, provider_type)
-
-def api_service_label(service: str) -> str:
-    return API_SERVICE_LABELS.get(service, API_SERVICE_LABELS[API_SERVICE_CUSTOM])
-
-def normalize_api_service(service: str) -> str:
-    if service in API_SERVICE_LABELS:
-        return service
-    return API_SERVICE_CUSTOM
-
-def service_preset(service: str) -> dict:
-    return dict(API_SERVICE_PRESETS.get(normalize_api_service(service), API_SERVICE_PRESETS[API_SERVICE_CUSTOM]))
-
-
-def normalize_provider_type(provider_type: str) -> str:
-    if provider_type in (PROVIDER_LM_STUDIO, PROVIDER_OPENAI_COMPAT, PROVIDER_OLLAMA):
-        return provider_type
-    return PROVIDER_LM_STUDIO
-
-
-def provider_defaults(provider_type: str) -> tuple[str, str]:
-    provider_type = normalize_provider_type(provider_type)
-    if provider_type == PROVIDER_OLLAMA:
-        return "http://localhost:11434", "model"
-    return "http://localhost:1234", "v1/models"
-
-
-def canonicalize_base_url(provider_type: str, base_url: str) -> str:
-    normalized_type = normalize_provider_type(provider_type)
-    cleaned = (base_url or "").strip().rstrip("/")
-    if not cleaned:
-        return cleaned
-
-    suffixes = []
-    if normalized_type == PROVIDER_LM_STUDIO:
-        suffixes = ["/v1/models", "/v1/chat/completions", "/v1"]
-    elif normalized_type == PROVIDER_OLLAMA:
-        suffixes = ["/api/tags", "/api/chat", "/api"]
-    else:
-        suffixes = ["/v1/models", "/models", "/v1/chat/completions", "/chat/completions"]
-
-    lower_cleaned = cleaned.lower()
-    for suffix in suffixes:
-        if lower_cleaned.endswith(suffix):
-            cleaned = cleaned[: -len(suffix)]
-            break
-    return cleaned.rstrip("/")
-
-
-def make_provider_config(
-    provider_type: str,
-    base_url: str,
-    api_key: str = "",
-    model_path: str = "",
-    api_service: str = API_SERVICE_CUSTOM,
-) -> ProviderConfig:
-    default_base, default_model_path = provider_defaults(provider_type)
-    normalized_type = normalize_provider_type(provider_type)
-    normalized_service = normalize_api_service(api_service)
-    preset = service_preset(normalized_service) if normalized_type == PROVIDER_OPENAI_COMPAT else {"base_url": "", "model_path": ""}
-    normalized_base = canonicalize_base_url(normalized_type, base_url or default_base)
-    if normalized_type == PROVIDER_OPENAI_COMPAT and normalized_service != API_SERVICE_CUSTOM and not base_url.strip():
-        normalized_base = preset["base_url"]
-    normalized_path = (model_path or default_model_path).strip().lstrip("/")
-    if normalized_type == PROVIDER_OPENAI_COMPAT and normalized_service != API_SERVICE_CUSTOM and not model_path.strip():
-        normalized_path = preset["model_path"]
-    if normalized_type == PROVIDER_LM_STUDIO:
-        normalized_path = "v1/models"
-    elif normalized_type == PROVIDER_OLLAMA:
-        normalized_path = "model"
-    return ProviderConfig(
-        provider_type=normalized_type,
-        base_url=normalized_base,
-        api_key=(api_key or "").strip(),
-        model_path=normalized_path,
-        api_service=normalized_service,
-    )
-
-
-def request_headers(provider: ProviderConfig) -> dict:
-    headers = {"Content-Type": "application/json"}
-    if provider.provider_type == PROVIDER_OPENAI_COMPAT and provider.api_key:
-        headers["Authorization"] = f"Bearer {provider.api_key}"
-    if provider.provider_type == PROVIDER_OPENAI_COMPAT and provider.api_service == API_SERVICE_OPENROUTER:
-        headers.setdefault("HTTP-Referer", "https://github.com/TrentPierce/PolyCouncil")
-        headers.setdefault("X-Title", "PolyCouncil")
-    return headers
-
-
-def endpoints(provider: ProviderConfig):
-    b = provider.base_url.rstrip("/")
-    if provider.provider_type == PROVIDER_LM_STUDIO:
-        return {
-            "chat": f"{b}/v1/chat/completions",
-            "models": f"{b}/v1/models",
-        }
-    if provider.provider_type == PROVIDER_OLLAMA:
-        return {
-            "chat": f"{b}/api/chat",
-            "models": f"{b}/api/tags",
-        }
-    model_path = provider.model_path or "v1/models"
-    lower = b.lower()
-    has_versioned_base = (
-        lower.endswith("/v1")
-        or lower.endswith("/v1beta")
-        or lower.endswith("/v1beta/openai")
-        or lower.endswith("/openai")
-        or lower.endswith("/api/v1")
-    )
-    if has_versioned_base:
-        chat_url = f"{b}/chat/completions"
-        models_url = f"{b}/{(model_path or 'models').lstrip('/')}"
-    else:
-        chat_url = f"{b}/v1/chat/completions"
-        models_url = f"{b}/{model_path}"
-    return {
-        "chat": chat_url,
-        "models": models_url,
-    }
-
-
-def parse_models_response(provider: ProviderConfig, data: dict) -> List[str]:
-    ids: List[str] = []
-    if provider.provider_type == PROVIDER_OLLAMA:
-        models = data.get("models", [])
-        if not isinstance(models, list):
-            return []
-        for item in models:
-            if not isinstance(item, dict):
-                continue
-            name = item.get("name")
-            if name:
-                ids.append(str(name))
-        return sorted(set(ids))
-    model_entries = data.get("data", [])
-    if not isinstance(model_entries, list):
-        return []
-    for item in model_entries:
-        if not isinstance(item, dict):
-            continue
-        mid = item.get("id") or item.get("name")
-        if mid:
-            ids.append(str(mid))
-    return sorted(set(ids))
-
-
-def fetch_models(provider: ProviderConfig) -> List[str]:
-    try:
-        model_url = endpoints(provider)["models"]
-        r = requests.get(model_url, headers=request_headers(provider), timeout=(5, 20))
-        r.raise_for_status()
-        try:
-            data = r.json()
-        except requests.JSONDecodeError as exc:
-            raise ModelFetchError(f"Endpoint returned non-JSON from {model_url}") from exc
-        models = parse_models_response(provider, data)
-        if models:
-            return models
-        raise ModelFetchError(f"No models found at {model_url}. Check whether the base URL already includes a path like /v1 or /v1/models.")
-    except Exception as e:
-        if isinstance(e, ModelFetchError):
-            raise
-        raise ModelFetchError(f"{provider_label(provider.provider_type)} request failed: {e}") from e
-
-# -----------------------
 # Concurrency helper
 # -----------------------
 async def run_limited(max_concurrency: int, callables: Iterable[Callable[[], Awaitable[Any]]]):
@@ -715,93 +411,6 @@ async def run_limited(max_concurrency: int, callables: Iterable[Callable[[], Awa
     for fn in callables:
         tasks.append(asyncio.create_task(runner(fn)))
     return await asyncio.gather(*tasks)
-
-# -----------------------
-# Model invocation
-# -----------------------
-async def call_model(
-    session: aiohttp.ClientSession,
-    provider: ProviderConfig,
-    model: str,
-    user_prompt: str,
-    temperature: float = 0.2,
-    sys_prompt: Optional[str] = None,
-    json_schema: Optional[dict] = None,
-    timeout_sec: int = 120,
-    images: Optional[List[str]] = None,
-    web_search: bool = False
-) -> Any:
-    """
-    Calls the selected provider API.
-    If json_schema is provided, uses response_format={"type":"json_schema","json_schema":{...}}.
-    Returns the content string from the first choice.
-    """
-    url = endpoints(provider)["chat"]
-    timeout = aiohttp.ClientTimeout(total=timeout_sec)
-    headers = request_headers(provider)
-    images = images or []
-
-    if provider.provider_type == PROVIDER_OLLAMA:
-        assembled_prompt = user_prompt if not sys_prompt else f"{sys_prompt}\n\n{user_prompt}"
-        payload = {
-            "model": model,
-            "stream": False,
-            "options": {"temperature": float(temperature)},
-            "messages": [{"role": "user", "content": assembled_prompt}],
-        }
-        _dbg("CALL payload", {"provider": provider.provider_type, "url": url, "payload": payload})
-        async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
-            txt = await resp.text()
-            if resp.status != 200:
-                raise RuntimeError(f"HTTP {resp.status} for {model}:\n{txt[:800]}")
-            try:
-                data = json.loads(txt)
-            except Exception as e:
-                raise RuntimeError(f"Non-JSON response for {model}:\n{txt[:800]}") from e
-            _dbg("CALL raw_response", data)
-            return data.get("message", {}).get("content", "")
-
-    messages = []
-    if sys_prompt:
-        messages.append({"role": "system", "content": sys_prompt})
-
-    if images:
-        content_list = [{"type": "text", "text": user_prompt}]
-        for image_url in images:
-            content_list.append({"type": "image_url", "image_url": {"url": image_url}})
-        messages.append({"role": "user", "content": content_list})
-    else:
-        messages.append({"role": "user", "content": user_prompt})
-
-    payload = {"model": model, "messages": messages, "temperature": float(temperature)}
-    if json_schema:
-        payload["response_format"] = {"type": "json_schema", "json_schema": json_schema}
-    if web_search:
-        payload["tools"] = [{
-            "type": "function",
-            "function": {
-                "name": "google_search",
-                "description": "Search the web for current information.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {"query": {"type": "string", "description": "The search query"}},
-                    "required": ["query"],
-                },
-            },
-        }]
-
-    _dbg("CALL payload", {"provider": provider.provider_type, "url": url, "payload": payload})
-    async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
-        txt = await resp.text()
-        if resp.status != 200:
-            raise RuntimeError(f"HTTP {resp.status} for {model}:\n{txt[:800]}")
-        try:
-            data = json.loads(txt)
-        except Exception as e:
-            raise RuntimeError(f"Non-JSON response for {model}:\n{txt[:800]}") from e
-        _dbg("CALL raw_response", data)
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return content
 
 # -----------------------
 # Voting schema & parsing
@@ -960,7 +569,7 @@ async def vote_one(
         schema = ballot_json_schema(num_candidates=len(idx_map_peer))
         content = await call_model(
             session, voter_provider, voter_raw_model, prompt,
-            temperature=0.0,
+            debug_hook=_dbg,
             sys_prompt="Be precise. Return only JSON according to the schema.",
             json_schema=schema
         )
@@ -982,7 +591,7 @@ async def vote_one(
     try:
         content = await call_model(
             session, voter_provider, voter_raw_model, prompt,
-            temperature=0.0,
+            debug_hook=_dbg,
             sys_prompt="Return only JSON for the ballot. No extra text.",
             json_schema=None
         )
@@ -1018,7 +627,7 @@ async def council_round(
     voter_override: Optional[List[str]] = None,
     images: Optional[List[str]] = None,
     web_search: bool = False,
-    temperature: float = 0.7,
+    temperature: Optional[float] = None,
     rubric_weights: Optional[Dict[str, int]] = None,
     is_cancelled: Optional[Callable[[], bool]] = None
 ):
@@ -1040,7 +649,8 @@ async def council_round(
             try:
                 ans = await call_model(
                     session, provider, raw_model, user_prompt,
-                    temperature=temperature, sys_prompt=sys_p, 
+                    debug_hook=_dbg,
+                    temperature=temperature, sys_prompt=sys_p,
                     images=images, web_search=web_search
                 )
                 if isinstance(ans, dict):
@@ -1145,7 +755,7 @@ class ModelFetchWorker(QtCore.QObject):
     @QtCore.Slot()
     def run(self):
         try:
-            models = fetch_models(self.provider)
+            models = asyncio.run(fetch_models(self.provider, provider_label=provider_label))
             self.finished.emit(models)
         except Exception as e:
             self.failed.emit(str(e))
@@ -1352,6 +962,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.settings_btn = QtWidgets.QPushButton("&Settings")
         self.settings_btn.setObjectName("SecondaryButton")
         self.settings_btn.setMinimumWidth(120)
+        self.settings_btn.setCheckable(True)
+        self.settings_btn.setToolTip("Open or close the workspace settings panel.")
 
         nav.addLayout(title_block, stretch=1)
         nav.addWidget(mode_label)
@@ -1367,7 +979,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.selection_badge.setObjectName("InfoBadge")
         self.attachment_badge = QtWidgets.QLabel("No attachments")
         self.attachment_badge.setObjectName("InfoBadge")
-        self.tool_badge = QtWidgets.QLabel("Temp 0.7 · Web off")
+        self.tool_badge = QtWidgets.QLabel("Web off")
         self.tool_badge.setObjectName("InfoBadge")
         badge_row.addWidget(self.mode_badge)
         badge_row.addWidget(self.selection_badge)
@@ -1385,9 +997,9 @@ class CouncilWindow(QtWidgets.QMainWindow):
         else:
             provider_group = QtWidgets.QGroupBox("Provider Connection")
             provider_layout = QtWidgets.QGridLayout(provider_group)
-        provider_layout.setContentsMargins(14, 12, 14, 14)
+        provider_layout.setContentsMargins(12, 10, 12, 12)
         provider_layout.setHorizontalSpacing(10)
-        provider_layout.setVerticalSpacing(10)
+        provider_layout.setVerticalSpacing(8)
 
         self.provider_combo = QtWidgets.QComboBox()
         self.provider_combo.addItems([
@@ -1438,7 +1050,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
             self._create_form_field(
                 "Base URL",
                 self.base_edit,
-                helper_text="Use LM Studio, Ollama, or a hosted API base URL. This field expands cleanly in snapped Windows layouts.",
+                helper_text="Use the local or hosted API base URL for the current provider.",
             ),
             1, 0, 1, 2
         )
@@ -1461,6 +1073,10 @@ class CouncilWindow(QtWidgets.QMainWindow):
         provider_layout.addLayout(provider_actions, 3, 0, 1, 2)
         provider_layout.setColumnStretch(0, 1)
         provider_layout.setColumnStretch(1, 1)
+        if _UI_AVAILABLE:
+            self._provider_collapsible.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
+        else:
+            provider_group.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
 
         # --- Run Settings (collapsible) ---
         if _UI_AVAILABLE:
@@ -1470,9 +1086,9 @@ class CouncilWindow(QtWidgets.QMainWindow):
         else:
             session_group = QtWidgets.QGroupBox("Run Settings")
             session_layout = QtWidgets.QGridLayout(session_group)
-        session_layout.setContentsMargins(14, 12, 14, 14)
+        session_layout.setContentsMargins(12, 10, 12, 12)
         session_layout.setHorizontalSpacing(10)
-        session_layout.setVerticalSpacing(10)
+        session_layout.setVerticalSpacing(8)
 
         self.single_voter_check = QtWidgets.QCheckBox("Single-voter")
         self.single_voter_combo = QtWidgets.QComboBox()
@@ -1482,23 +1098,11 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.conc_spin = QtWidgets.QSpinBox()
         self.conc_spin.setRange(1, 8)
         self.conc_spin.setValue(1)
-        self.conc_warn = QtWidgets.QLabel("Higher values can overwhelm modest hardware.")
-        self.conc_warn.setObjectName("HintLabel")
-        self.conc_warn.setWordWrap(True)
-        self.conc_warn.setVisible(False)
-
         self.web_search_check = QtWidgets.QCheckBox("Enable Web Search")
         self.web_search_check.setEnabled(False)
         self.web_search_check.setToolTip("Enable only when a selected model exposes web tools.")
-
-        self.temp_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.temp_slider.setRange(0, 100)
-        self.temp_slider.setValue(70)
-        self.temp_value_label = QtWidgets.QLabel("0.7")
-        self.temp_value_label.setObjectName("MetricValue")
-        self.temp_slider.valueChanged.connect(lambda v: self.temp_value_label.setText(f"{v/100:.1f}"))
         self.mode_help_label = QtWidgets.QLabel(
-            "Use the mode switch in the header to choose weighted deliberation or collaborative discussion."
+            "Use the header mode switch to choose weighted deliberation or collaborative discussion."
         )
         self.mode_help_label.setObjectName("HintLabel")
         self.mode_help_label.setWordWrap(True)
@@ -1515,27 +1119,30 @@ class CouncilWindow(QtWidgets.QMainWindow):
             self._create_form_field(
                 "Concurrency",
                 self.conc_spin,
-                helper_text="Higher values run faster but can reduce stability on modest hardware.",
+                helper_text="Keep this low on local hardware for steadier runs.",
             ),
             2, 0
         )
         session_layout.addWidget(
             self._create_form_field(
-                "Temperature",
-                self.temp_slider,
-                helper_text="Use lower values for steadier comparisons and higher values for broader exploration.",
-                trailing=self.temp_value_label,
+                "Tools",
+                self.web_search_check,
+                helper_text="Turn web tools on only when the selected models support them.",
             ),
             2, 1
         )
-        session_layout.addWidget(self.web_search_check, 3, 0)
-        session_layout.addWidget(self.conc_warn, 4, 0, 1, 2)
         session_layout.setColumnStretch(0, 1)
         session_layout.setColumnStretch(1, 1)
+        if _UI_AVAILABLE:
+            self._session_collapsible.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
+        else:
+            session_group.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
 
         # Assemble the controls area
         controls_splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         controls_splitter.setChildrenCollapsible(False)
+        controls_splitter.setHandleWidth(1)
+        controls_splitter.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Maximum)
         if _UI_AVAILABLE:
             self._provider_collapsible.add_widget(provider_inner)
             self._session_collapsible.add_widget(session_inner)
@@ -1544,7 +1151,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
         else:
             controls_splitter.addWidget(provider_group)
             controls_splitter.addWidget(session_group)
-        controls_splitter.setSizes([760, 460])
+        controls_splitter.setSizes([700, 420])
         layout.addWidget(controls_splitter)
 
         # --- Saved Provider Profiles (collapsible, starts collapsed) ---
@@ -1588,8 +1195,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
         models_group = QtWidgets.QGroupBox("Model Selection")
         models_layout = QtWidgets.QVBoxLayout(models_group)
-        models_layout.setContentsMargins(14, 18, 14, 14)
-        models_layout.setSpacing(8)
+        models_layout.setContentsMargins(12, 16, 12, 12)
+        models_layout.setSpacing(10)
         self.model_filter_edit = QtWidgets.QLineEdit()
         self.model_filter_edit.setPlaceholderText("Filter models by provider, capability, or name")
         self.model_selection_label = QtWidgets.QLabel("0 selected of 0 loaded")
@@ -1621,8 +1228,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
         self.leaderboard_group = QtWidgets.QGroupBox("Leaderboard")
         leaderboard_layout = QtWidgets.QVBoxLayout(self.leaderboard_group)
-        leaderboard_layout.setContentsMargins(14, 18, 14, 14)
-        leaderboard_layout.setSpacing(8)
+        leaderboard_layout.setContentsMargins(12, 16, 12, 12)
+        leaderboard_layout.setSpacing(10)
         lb_header = QtWidgets.QHBoxLayout()
         self.lb_title = QtWidgets.QLabel("Council performance over time")
         self.lb_title.setObjectName("HintLabel")
@@ -1641,12 +1248,12 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
         workspace_group = QtWidgets.QGroupBox("Workspace")
         workspace_layout = QtWidgets.QVBoxLayout(workspace_group)
-        workspace_layout.setContentsMargins(14, 18, 14, 14)
+        workspace_layout.setContentsMargins(12, 16, 12, 12)
         workspace_layout.setSpacing(10)
 
         attachment_group = QtWidgets.QGroupBox("Context & Attachments")
         attachment_layout = QtWidgets.QVBoxLayout(attachment_group)
-        attachment_layout.setContentsMargins(12, 16, 12, 12)
+        attachment_layout.setContentsMargins(12, 12, 12, 12)
         attachment_layout.setSpacing(8)
         file_btn_row = QtWidgets.QHBoxLayout()
         self.upload_btn = QtWidgets.QPushButton("&Upload files")
@@ -1661,7 +1268,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
         file_btn_row.addStretch(1)
         file_btn_row.addWidget(self.visual_status)
         self.files_list = AttachmentListWidget()
-        self.files_list.setMaximumHeight(120)
+        self.files_list.setMaximumHeight(96)
         self.files_list.setToolTip("Uploaded files are parsed and added to the council context. Double-click an item to remove it.")
         attachment_layout.addLayout(file_btn_row)
         attachment_layout.addWidget(self.files_list)
@@ -1730,8 +1337,8 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
         results_group = QtWidgets.QGroupBox("Results")
         results_layout = QtWidgets.QVBoxLayout(results_group)
-        results_layout.setContentsMargins(14, 18, 14, 14)
-        results_layout.setSpacing(8)
+        results_layout.setContentsMargins(12, 16, 12, 12)
+        results_layout.setSpacing(10)
         right_header = QtWidgets.QHBoxLayout()
         self.tabs_title = QtWidgets.QLabel("Per-Model Answers")
         self.tabs_title.setObjectName("SectionTitle")
@@ -1796,7 +1403,12 @@ class CouncilWindow(QtWidgets.QMainWindow):
         view.setOpenExternalLinks(True)
         view.setReadOnly(True)
         view.setUndoRedoEnabled(False)
+        view.setFrameShape(QtWidgets.QFrame.NoFrame)
+        view.setLineWrapMode(QtWidgets.QTextEdit.WidgetWidth)
+        view.setWordWrapMode(QtGui.QTextOption.WrapAtWordBoundaryOrAnywhere)
+        view.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         view.document().setDocumentMargin(12)
+        self._apply_output_view_theme(view)
         return view
 
     def _create_form_field(
@@ -1871,6 +1483,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
     def _apply_window_style(self):
         if self._theme_engine:
             self._theme_engine.apply(self)
+            self._refresh_output_document_styles()
             self._set_badge_tone(self.status_badge, "neutral")
             return
         # Fallback: original hardcoded QSS
@@ -1993,6 +1606,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
             }
             """
         )
+        self._refresh_output_document_styles()
         self._set_badge_tone(self.status_badge, "neutral")
 
     def _set_badge_tone(self, badge: QtWidgets.QLabel, tone: str):
@@ -2007,6 +1621,114 @@ class CouncilWindow(QtWidgets.QMainWindow):
     def _is_dark_palette(self) -> bool:
         return self.palette().color(QtGui.QPalette.Window).lightness() < 128
 
+    def _surface_tokens(self) -> Dict[str, str]:
+        if self._theme_engine:
+            t = self._theme_engine.tokens
+            return {
+                "text_primary": t.text_primary,
+                "text_secondary": t.text_secondary,
+                "text_muted": t.text_muted,
+                "border": t.border,
+                "panel": t.bg_elevated,
+                "panel_alt": t.bg_tertiary,
+                "panel_subtle": t.bg_secondary,
+                "accent": t.accent,
+                "accent_muted": t.accent_muted,
+                "danger": t.danger,
+                "danger_bg": t.danger_bg,
+                "success": t.success,
+                "success_bg": t.success_bg,
+            }
+        return {
+            "text_primary": self._palette_hex(QtGui.QPalette.Text),
+            "text_secondary": self._palette_hex(QtGui.QPalette.Mid),
+            "text_muted": self._palette_hex(QtGui.QPalette.Mid),
+            "border": self._palette_hex(QtGui.QPalette.Midlight),
+            "panel": self._palette_hex(QtGui.QPalette.Base),
+            "panel_alt": self._palette_hex(QtGui.QPalette.AlternateBase),
+            "panel_subtle": self._palette_hex(QtGui.QPalette.Window),
+            "accent": "#2d7dd2",
+            "accent_muted": self._palette_hex(QtGui.QPalette.AlternateBase),
+            "danger": "#b94b4b",
+            "danger_bg": "#ffe8e8",
+            "success": "#2e7d32",
+            "success_bg": "#e8f5e9",
+        }
+
+    def _output_document_css(self) -> str:
+        c = self._surface_tokens()
+        return f"""
+        body {{
+            background: transparent;
+            color: {c["text_primary"]};
+            font-family: "Segoe UI";
+            font-size: 13px;
+            line-height: 1.5;
+        }}
+        p, ul, ol {{
+            margin-top: 0;
+            margin-bottom: 10px;
+            color: {c["text_primary"]};
+        }}
+        li {{
+            margin-bottom: 4px;
+        }}
+        h1, h2, h3, h4, h5, h6 {{
+            color: {c["text_primary"]};
+            margin-top: 0;
+            margin-bottom: 8px;
+        }}
+        a {{
+            color: {c["accent"]};
+        }}
+        code {{
+            color: {c["text_primary"]};
+            background: {c["panel_subtle"]};
+            border-radius: 6px;
+            padding: 1px 4px;
+        }}
+        pre {{
+            white-space: pre-wrap;
+            color: {c["text_primary"]};
+            background: {c["panel_subtle"]};
+            border: 1px solid {c["border"]};
+            border-radius: 10px;
+            padding: 10px 12px;
+            margin: 0 0 12px 0;
+        }}
+        blockquote {{
+            margin: 0 0 12px 0;
+            padding: 0 0 0 12px;
+            border-left: 3px solid {c["border"]};
+            color: {c["text_secondary"]};
+        }}
+        table {{
+            width: 100%;
+        }}
+        td {{
+            vertical-align: top;
+        }}
+        """
+
+    def _apply_output_view_theme(self, view: Optional[QtWidgets.QTextBrowser]):
+        if view is None:
+            return
+        view.document().setDefaultStyleSheet(self._output_document_css())
+
+    def _refresh_output_document_styles(self):
+        for attr in (
+            "chat_view",
+            "results_overview_view",
+            "results_winner_view",
+            "results_ballots_view",
+            "results_discussion_view",
+            "selected_model_detail_view",
+            "persona_preview",
+        ):
+            widget = getattr(self, attr, None)
+            if isinstance(widget, QtWidgets.QTextBrowser):
+                self._apply_output_view_theme(widget)
+
     def _safe_markdown_html(self, text: str) -> str:
         if markdown_to_safe_html:
             return markdown_to_safe_html(text)
@@ -2014,14 +1736,11 @@ class CouncilWindow(QtWidgets.QMainWindow):
         return f"<p>{safe}</p>"
 
     def _placeholder_html(self, title: str, message: str) -> str:
-        title_color = self._palette_hex(QtGui.QPalette.Text)
-        body_color = self._palette_hex(QtGui.QPalette.Mid)
-        border_color = self._palette_hex(QtGui.QPalette.Midlight)
-        bg_color = self._palette_hex(QtGui.QPalette.AlternateBase)
+        colors = self._surface_tokens()
         return f"""
-        <div style="border:1px solid {border_color}; border-radius:16px; padding:18px; background:{bg_color};">
-            <div style="font-size:16px; font-weight:700; color:{title_color}; margin-bottom:6px;">{title}</div>
-            <div style="color:{body_color}; line-height:1.5;">{message}</div>
+        <div style="border:1px solid {colors['border']}; border-radius:16px; padding:18px; background:{colors['panel_subtle']};">
+            <div style="font-size:16px; font-weight:700; color:{colors['text_primary']}; margin-bottom:6px;">{title}</div>
+            <div style="color:{colors['text_secondary']}; line-height:1.5;">{message}</div>
         </div>
         """
 
@@ -2036,7 +1755,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
             "No attachments" if file_count == 0 else f"{file_count} attachment{'s' if file_count != 1 else ''}"
         )
         web_text = "Web on" if self.web_search_check.isChecked() else "Web off"
-        self.tool_badge.setText(f"Temp {self.temp_slider.value()/100:.1f} · {web_text}")
+        self.tool_badge.setText(web_text)
 
     def _refresh_selection_summary(self):
         total_models = len(self.models)
@@ -2094,9 +1813,10 @@ class CouncilWindow(QtWidgets.QMainWindow):
         persona = self.persona_assignments.get(model_id, "None")
         provider_text = self._model_badge_text(model_id)
         esc = escape_text if escape_text else (lambda value: str(value))
+        colors = self._surface_tokens()
         detail_html = f"""
         <div style="font-size:20px; font-weight:700; margin-bottom:6px;">{esc(short_id(model_id))}</div>
-        <div style="margin-bottom:10px; color:{self._palette_hex(QtGui.QPalette.Mid)};">{esc(provider_text)}</div>
+        <div style="margin-bottom:10px; color:{colors['text_secondary']};">{esc(provider_text)}</div>
         <div style="margin-bottom:16px;"><strong>Score:</strong> {esc(str(score))}<br><strong>Persona:</strong> {esc(persona)}</div>
         {self._safe_markdown_html(answer or "_No response returned._")}
         """
@@ -2141,82 +1861,99 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.log_dock.hide()
 
     def _setup_settings_dock(self):
-        self.utility_dock = QtWidgets.QDockWidget("Workspace Panel", self)
-        self.utility_dock.setAllowedAreas(QtCore.Qt.RightDockWidgetArea | QtCore.Qt.LeftDockWidgetArea)
-        self.utility_dock.setFeatures(
-            QtWidgets.QDockWidget.DockWidgetMovable | QtWidgets.QDockWidget.DockWidgetClosable
-        )
+        if build_workspace_panel:
+            panel = build_workspace_panel(self, create_output_view=self._create_output_view)
+            self.utility_dock = panel.dock
+            self.utility_tabs = panel.tabs
+            self.settings_debug_check = panel.settings_debug_check
+            self.settings_personas_check = panel.settings_personas_check
+            self.settings_storage_label = panel.settings_storage_label
+            self.settings_shortcuts_btn = panel.settings_shortcuts_btn
+            self.settings_issue_btn = panel.settings_issue_btn
+            self.persona_search_edit = panel.persona_search_edit
+            self.persona_library_list = panel.persona_library_list
+            self.persona_preview = panel.persona_preview
+            self.persona_add_btn = panel.persona_add_btn
+            self.persona_edit_btn = panel.persona_edit_btn
+            self.persona_delete_btn = panel.persona_delete_btn
+        else:
+            self.utility_dock = QtWidgets.QDockWidget("Workspace Panel", self)
+            self.utility_dock.setAllowedAreas(QtCore.Qt.RightDockWidgetArea | QtCore.Qt.LeftDockWidgetArea)
+            self.utility_dock.setFeatures(
+                QtWidgets.QDockWidget.DockWidgetMovable | QtWidgets.QDockWidget.DockWidgetClosable
+            )
 
-        container = QtWidgets.QWidget()
-        layout = QtWidgets.QVBoxLayout(container)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+            container = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout(container)
+            layout.setContentsMargins(12, 12, 12, 12)
+            layout.setSpacing(10)
 
-        self.utility_tabs = QtWidgets.QTabWidget()
-        self.utility_tabs.setDocumentMode(True)
+            self.utility_tabs = QtWidgets.QTabWidget()
+            self.utility_tabs.setDocumentMode(True)
 
-        settings_page = QtWidgets.QWidget()
-        settings_layout = QtWidgets.QVBoxLayout(settings_page)
-        settings_layout.setContentsMargins(8, 8, 8, 8)
-        settings_layout.setSpacing(12)
-        settings_intro = QtWidgets.QLabel(
-            "Settings are applied immediately. Use this panel for stable app preferences and support links."
-        )
-        settings_intro.setObjectName("HintLabel")
-        settings_intro.setWordWrap(True)
-        settings_layout.addWidget(settings_intro)
+            settings_page = QtWidgets.QWidget()
+            settings_layout = QtWidgets.QVBoxLayout(settings_page)
+            settings_layout.setContentsMargins(8, 8, 8, 8)
+            settings_layout.setSpacing(12)
+            settings_intro = QtWidgets.QLabel(
+                "Settings are applied immediately. Use this panel for stable app preferences and support links."
+            )
+            settings_intro.setObjectName("HintLabel")
+            settings_intro.setWordWrap(True)
+            settings_layout.addWidget(settings_intro)
 
-        self.settings_debug_check = QtWidgets.QCheckBox("Enable debug logs")
-        self.settings_personas_check = QtWidgets.QCheckBox("Show persona controls in the workflow")
-        self.settings_storage_label = QtWidgets.QLabel("")
-        self.settings_storage_label.setObjectName("HintLabel")
-        self.settings_storage_label.setWordWrap(True)
-        self.settings_shortcuts_btn = QtWidgets.QPushButton("Keyboard Shortcuts")
-        self.settings_shortcuts_btn.setObjectName("SecondaryButton")
-        self.settings_issue_btn = QtWidgets.QPushButton("Report an Issue")
-        self.settings_issue_btn.setObjectName("SecondaryButton")
+            self.settings_debug_check = QtWidgets.QCheckBox("Enable debug logs")
+            self.settings_personas_check = QtWidgets.QCheckBox("Show persona controls in the workflow")
+            self.settings_storage_label = QtWidgets.QLabel("")
+            self.settings_storage_label.setObjectName("HintLabel")
+            self.settings_storage_label.setWordWrap(True)
+            self.settings_shortcuts_btn = QtWidgets.QPushButton("Keyboard Shortcuts")
+            self.settings_shortcuts_btn.setObjectName("SecondaryButton")
+            self.settings_issue_btn = QtWidgets.QPushButton("Report an Issue")
+            self.settings_issue_btn.setObjectName("SecondaryButton")
 
-        settings_layout.addWidget(self.settings_debug_check)
-        settings_layout.addWidget(self.settings_personas_check)
-        settings_layout.addWidget(self.settings_storage_label)
-        settings_layout.addWidget(self.settings_shortcuts_btn)
-        settings_layout.addWidget(self.settings_issue_btn)
-        settings_layout.addStretch(1)
+            settings_layout.addWidget(self.settings_debug_check)
+            settings_layout.addWidget(self.settings_personas_check)
+            settings_layout.addWidget(self.settings_storage_label)
+            settings_layout.addWidget(self.settings_shortcuts_btn)
+            settings_layout.addWidget(self.settings_issue_btn)
+            settings_layout.addStretch(1)
 
-        personas_page = QtWidgets.QWidget()
-        personas_layout = QtWidgets.QVBoxLayout(personas_page)
-        personas_layout.setContentsMargins(8, 8, 8, 8)
-        personas_layout.setSpacing(10)
-        personas_intro = QtWidgets.QLabel(
-            "Manage the persona library here. Assign personas from the model list in the workflow."
-        )
-        personas_intro.setObjectName("HintLabel")
-        personas_intro.setWordWrap(True)
-        self.persona_search_edit = QtWidgets.QLineEdit()
-        self.persona_search_edit.setPlaceholderText("Filter persona library")
-        self.persona_library_list = QtWidgets.QListWidget()
-        self.persona_preview = QtWidgets.QTextBrowser()
-        self.persona_preview.setReadOnly(True)
-        persona_actions = QtWidgets.QHBoxLayout()
-        self.persona_add_btn = QtWidgets.QPushButton("Add Persona")
-        self.persona_edit_btn = QtWidgets.QPushButton("Edit Persona")
-        self.persona_delete_btn = QtWidgets.QPushButton("Delete Persona")
-        persona_actions.addWidget(self.persona_add_btn)
-        persona_actions.addWidget(self.persona_edit_btn)
-        persona_actions.addWidget(self.persona_delete_btn)
-        persona_actions.addStretch(1)
-        personas_layout.addWidget(personas_intro)
-        personas_layout.addWidget(self.persona_search_edit)
-        personas_layout.addWidget(self.persona_library_list, 1)
-        personas_layout.addLayout(persona_actions)
-        personas_layout.addWidget(self.persona_preview, 1)
+            personas_page = QtWidgets.QWidget()
+            personas_layout = QtWidgets.QVBoxLayout(personas_page)
+            personas_layout.setContentsMargins(8, 8, 8, 8)
+            personas_layout.setSpacing(10)
+            personas_intro = QtWidgets.QLabel(
+                "Manage the persona library here. Assign personas from the model list in the workflow."
+            )
+            personas_intro.setObjectName("HintLabel")
+            personas_intro.setWordWrap(True)
+            self.persona_search_edit = QtWidgets.QLineEdit()
+            self.persona_search_edit.setPlaceholderText("Filter persona library")
+            self.persona_library_list = QtWidgets.QListWidget()
+            self.persona_preview = self._create_output_view()
+            persona_actions = QtWidgets.QHBoxLayout()
+            self.persona_add_btn = QtWidgets.QPushButton("Add Persona")
+            self.persona_edit_btn = QtWidgets.QPushButton("Edit Persona")
+            self.persona_delete_btn = QtWidgets.QPushButton("Delete Persona")
+            persona_actions.addWidget(self.persona_add_btn)
+            persona_actions.addWidget(self.persona_edit_btn)
+            persona_actions.addWidget(self.persona_delete_btn)
+            persona_actions.addStretch(1)
+            personas_layout.addWidget(personas_intro)
+            personas_layout.addWidget(self.persona_search_edit)
+            personas_layout.addWidget(self.persona_library_list, 1)
+            personas_layout.addLayout(persona_actions)
+            personas_layout.addWidget(self.persona_preview, 1)
 
-        self.utility_tabs.addTab(settings_page, "Settings")
-        self.utility_tabs.addTab(personas_page, "Personas")
-        layout.addWidget(self.utility_tabs)
-        self.utility_dock.setWidget(container)
+            self.utility_tabs.addTab(settings_page, "Settings")
+            self.utility_tabs.addTab(personas_page, "Personas")
+            layout.addWidget(self.utility_tabs)
+            self.utility_dock.setWidget(container)
+
         self.addDockWidget(QtCore.Qt.RightDockWidgetArea, self.utility_dock)
         self.utility_dock.hide()
+        self.utility_dock.visibilityChanged.connect(self._settings_dock_visibility_changed)
 
         self.settings_debug_check.toggled.connect(self._debug_toggled)
         self.settings_personas_check.toggled.connect(self._settings_personas_toggled)
@@ -2259,7 +1996,6 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.remove_file_btn.clicked.connect(self._remove_selected_files)
         self.clear_files_btn.clicked.connect(self._clear_files)
         self.web_search_check.toggled.connect(self._web_search_toggled)
-        self.temp_slider.valueChanged.connect(lambda _value: self._refresh_header_badges())
         self.model_filter_edit.textChanged.connect(self._filter_model_rows)
         self.files_list.filesDropped.connect(self._handle_dropped_files)
         self.files_list.itemDoubleClicked.connect(self._remove_file_item)
@@ -2397,9 +2133,10 @@ class CouncilWindow(QtWidgets.QMainWindow):
             return
         prompt = persona.get("prompt") or "No prompt configured."
         assignment_count = sum(1 for assigned in self.persona_assignments.values() if assigned == persona["name"])
+        colors = self._surface_tokens()
         self.persona_preview.setHtml(
             f"<div style='font-size:18px; font-weight:700; margin-bottom:6px;'>{escape_text(persona['name']) if escape_text else persona['name']}</div>"
-            f"<div style='margin-bottom:10px; color:{self._palette_hex(QtGui.QPalette.Mid)};'>"
+            f"<div style='margin-bottom:10px; color:{colors['text_secondary']};'>"
             f"{'Built-in' if persona.get('builtin', False) else 'Custom'} persona · Assigned to {assignment_count} model(s)</div>"
             f"{self._safe_markdown_html(prompt)}"
         )
@@ -2729,29 +2466,41 @@ class CouncilWindow(QtWidgets.QMainWindow):
     def _render_provider_profiles(self):
         if not hasattr(self, "providers_layout"):
             return
-        while self.providers_layout.count():
-            item = self.providers_layout.takeAt(0)
-            if item.widget():
-                item.widget().setParent(None)
-            del item
+        if clear_layout:
+            clear_layout(self.providers_layout)
+        else:
+            while self.providers_layout.count():
+                item = self.providers_layout.takeAt(0)
+                if item.widget():
+                    item.widget().setParent(None)
+                del item
         self.provider_profile_rows.clear()
         for profile in self.provider_profiles:
-            row = QtWidgets.QWidget()
-            row_layout = QtWidgets.QHBoxLayout(row)
-            row_layout.setContentsMargins(2, 2, 2, 2)
-            row_layout.setSpacing(6)
-            label = QtWidgets.QLabel(self._profile_summary(profile))
-            use_btn = QtWidgets.QPushButton("Use")
-            add_btn = QtWidgets.QPushButton("Load")
-            rm_btn = QtWidgets.QPushButton("Remove")
             pid = profile.get("id", "")
-            use_btn.clicked.connect(lambda _=False, x=pid: self._profile_use_clicked(x))
-            add_btn.clicked.connect(lambda _=False, x=pid: self._profile_add_models_clicked(x))
-            rm_btn.clicked.connect(lambda _=False, x=pid: self._profile_remove_clicked(x))
-            row_layout.addWidget(label, 1)
-            row_layout.addWidget(use_btn)
-            row_layout.addWidget(add_btn)
-            row_layout.addWidget(rm_btn)
+            if build_provider_profile_row:
+                row = build_provider_profile_row(
+                    summary=self._profile_summary(profile),
+                    profile_id=pid,
+                    on_use=self._profile_use_clicked,
+                    on_load=self._profile_add_models_clicked,
+                    on_remove=self._profile_remove_clicked,
+                )
+            else:
+                row = QtWidgets.QWidget()
+                row_layout = QtWidgets.QHBoxLayout(row)
+                row_layout.setContentsMargins(2, 2, 2, 2)
+                row_layout.setSpacing(6)
+                label = QtWidgets.QLabel(self._profile_summary(profile))
+                use_btn = QtWidgets.QPushButton("Use")
+                add_btn = QtWidgets.QPushButton("Load")
+                rm_btn = QtWidgets.QPushButton("Remove")
+                use_btn.clicked.connect(lambda _=False, x=pid: self._profile_use_clicked(x))
+                add_btn.clicked.connect(lambda _=False, x=pid: self._profile_add_models_clicked(x))
+                rm_btn.clicked.connect(lambda _=False, x=pid: self._profile_remove_clicked(x))
+                row_layout.addWidget(label, 1)
+                row_layout.addWidget(use_btn)
+                row_layout.addWidget(add_btn)
+                row_layout.addWidget(rm_btn)
             self.providers_layout.addWidget(row)
             self.provider_profile_rows[pid] = row
         self.providers_layout.addStretch(1)
@@ -2985,16 +2734,22 @@ class CouncilWindow(QtWidgets.QMainWindow):
 
     def _concurrency_changed(self, value: int):
         save_settings({"max_concurrency": int(value)})
-        # Show warning only when concurrency is high enough to potentially cause issues
-        self.conc_warn.setVisible(value > 2)
         self._refresh_header_badges()
 
     def _open_settings_dialog(self):
+        if self.utility_dock.isVisible():
+            self.utility_dock.hide()
+            return
         self._refresh_settings_panel()
         self._refresh_persona_library_panel()
         self.utility_tabs.setCurrentIndex(0)
         self.utility_dock.show()
         self.utility_dock.raise_()
+
+    def _settings_dock_visibility_changed(self, visible: bool):
+        self.settings_btn.blockSignals(True)
+        self.settings_btn.setChecked(bool(visible))
+        self.settings_btn.blockSignals(False)
 
     def _single_voter_toggled_state(self, state: int):
         # 'state' is a Qt.CheckState enum; compare directly
@@ -3472,16 +3227,17 @@ class CouncilWindow(QtWidgets.QMainWindow):
             return
 
         is_dark = self._is_dark_palette()
-        text_color = self._palette_hex(QtGui.QPalette.Text)
-        muted_color = self._palette_hex(QtGui.QPalette.Mid)
-        border_color = self._palette_hex(QtGui.QPalette.Midlight)
-        base_color = self._palette_hex(QtGui.QPalette.Base)
-        alt_color = self._palette_hex(QtGui.QPalette.AlternateBase)
+        colors = self._surface_tokens()
+        text_color = colors["text_primary"]
+        muted_color = colors["text_secondary"]
+        border_color = colors["border"]
+        base_color = colors["panel_subtle"]
+        alt_color = colors["panel_alt"]
         user_bg = "#1f4f82" if is_dark else "#e8f2ff"
         user_fg = "#f7fbff" if is_dark else text_color
-        council_bg = "#222d3c" if is_dark else alt_color
+        council_bg = colors["panel"]
         note_bg = "transparent"
-        error_bg = "#612626" if is_dark else "#ffe8e8"
+        error_bg = colors["danger_bg"]
         style = "margin: 6px 0; padding: 10px 12px; border-radius: 12px;"
         header = ""
 
@@ -3490,7 +3246,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
             header = "You"
             body = text[len("You:"):].strip()
         elif text.startswith("[Error]"):
-            style += f"background-color: {error_bg}; color: {text_color}; border: 1px solid #b94b4b;"
+            style += f"background-color: {error_bg}; color: {text_color}; border: 1px solid {colors['danger']};"
             header = "Error"
             body = text[len("[Error]"):].strip()
         elif text.startswith("[Stopped]"):
@@ -3587,7 +3343,6 @@ class CouncilWindow(QtWidgets.QMainWindow):
             "base_edit",
             "api_key_inline",
             "mode_combo",
-            "temp_slider",
             "single_voter_check",
             "single_voter_combo",
             "upload_btn",
@@ -3883,10 +3638,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
         conc =  int(self.conc_spin.value())
         single_voter_enabled = self.single_voter_check.isChecked()
         single_voter_model   = self.single_voter_combo.currentText().strip()
-        
-        # Get temperature from slider (convert 0-100 to 0.0-1.0)
-        temp = self.temp_slider.value() / 100.0
-        
+
         # Web search status
         web_search = self.web_search_check.isChecked()
         model_entries = []
@@ -3911,7 +3663,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
                     council_round(
                         model_entries, question, roles_map, self.status_signal.emit,
                         max_concurrency=conc, voter_override=voters,
-                        images=images, web_search=web_search, temperature=temp,
+                        images=images, web_search=web_search,
                         rubric_weights=self.rubric_weights,
                         is_cancelled=lambda: self._stop_requested
                     )
@@ -3974,7 +3726,6 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self._set_status("Starting collaborative discussion…")
 
         conc = int(self.conc_spin.value())
-        temp = self.temp_slider.value() / 100.0
         web_search = self.web_search_check.isChecked()
 
         def worker():
@@ -3991,7 +3742,6 @@ class CouncilWindow(QtWidgets.QMainWindow):
                     context_block=context_block,
                     images=images,
                     web_search_enabled=web_search,
-                    temperature=temp,
                     status_callback=self.status_signal.emit,
                     update_callback=lambda entry: self.discussion_update_signal.emit(entry),
                     max_turns=10,
@@ -4100,7 +3850,15 @@ class CouncilWindow(QtWidgets.QMainWindow):
         
         # Add entry to transcript
         self.discussion_transcript.append(entry)
-        self.results_discussion_view.setHtml(self._build_discussion_transcript_html(self.discussion_transcript))
+        self.results_discussion_view.setHtml(
+            result_presenter.build_discussion_transcript_html(
+                transcript=self.discussion_transcript,
+                colors=self._surface_tokens(),
+                safe_markdown_html=self._safe_markdown_html,
+                placeholder_html=self._placeholder_html,
+                escape_text=escape_text,
+            )
+        )
         self.results_discussion_view.verticalScrollBar().setValue(
             self.results_discussion_view.verticalScrollBar().maximum()
         )
@@ -4148,177 +3906,6 @@ class CouncilWindow(QtWidgets.QMainWindow):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Export Error", f"Failed to export discussion: {str(e)}")
 
-    def _render_answer_html(self, model_id: str, answer: str) -> str:
-        safe_model = escape_text(short_id(model_id)) if escape_text else short_id(model_id)
-        meta_text = escape_text(self._model_badge_text(model_id)) if escape_text else self._model_badge_text(model_id)
-        return f"""
-        <div style="font-size:18px; font-weight:700; margin-bottom:6px;">{safe_model}</div>
-        <div style="margin-bottom:14px; color:{self._palette_hex(QtGui.QPalette.Mid)};">{meta_text}</div>
-        {self._safe_markdown_html(answer or "_No response returned._")}
-        """
-
-    def _build_deliberation_summary_html(
-        self,
-        question: str,
-        answers: Dict[str, str],
-        winner: str,
-        details: Dict[str, Any],
-        tally: Dict[str, Any],
-    ) -> str:
-        valid_votes = details.get("valid_votes", {}) or {}
-        invalid_votes = details.get("invalid_votes", {}) or {}
-        vote_messages = details.get("vote_messages", {}) or {}
-        voters_used = details.get("voters_used", []) or []
-        timings_ms = details.get("timings_ms", {}) or {}
-        rubric_weights = normalize_rubric_weights(details.get("rubric_weights"))
-        esc = escape_text if escape_text else (lambda value: str(value))
-
-        ranking_rows = "".join(
-            f"<li><strong>{esc(short_id(model_id))}</strong> · score {tally[model_id]}</li>"
-            for model_id in sorted(tally.keys(), key=lambda key: (-tally[key], key))
-        ) or "<li>No scores available.</li>"
-
-        latency_rows = "".join(
-            f"<li><strong>{esc(short_id(model_id))}</strong> · {int(timings_ms[model_id])} ms</li>"
-            for model_id in sorted(timings_ms.keys(), key=lambda mid: (timings_ms[mid], mid))
-        ) if timings_ms else ""
-
-        note_rows = "".join(
-            f"<li><strong>{esc(short_id(voter))}</strong> · {esc(msg)}</li>"
-            for voter, msg in vote_messages.items()
-        ) if vote_messages else ""
-
-        winner_answer_html = self._safe_markdown_html(answers.get(winner, ""))
-        mid_color = self._palette_hex(QtGui.QPalette.Mid)
-        border_color = self._palette_hex(QtGui.QPalette.Midlight)
-        alt_color = self._palette_hex(QtGui.QPalette.AlternateBase)
-
-        html = [
-            f"<div style='font-size:20px; font-weight:700; margin-bottom:6px;'>Council Summary</div>",
-            f"<div style='color:{mid_color}; margin-bottom:16px;'>{esc(question)}</div>",
-            "<table style='width:100%; border-collapse:separate; border-spacing:0 8px; margin-bottom:18px;'>",
-            "<tr>",
-            f"<td style='padding:12px; border:1px solid {border_color}; border-radius:12px; background:{alt_color};'><strong>Winner</strong><br>{esc(short_id(winner))}</td>",
-            f"<td style='padding:12px; border:1px solid {border_color}; border-radius:12px; background:{alt_color};'><strong>Valid ballots</strong><br>{len(valid_votes)}</td>",
-            f"<td style='padding:12px; border:1px solid {border_color}; border-radius:12px; background:{alt_color};'><strong>Invalid ballots</strong><br>{len(invalid_votes)}</td>",
-            f"<td style='padding:12px; border:1px solid {border_color}; border-radius:12px; background:{alt_color};'><strong>Voters used</strong><br>{esc(', '.join(short_id(v) for v in voters_used)) if voters_used else 'All selected models'}</td>",
-            "</tr>",
-            "</table>",
-            f"<div style='font-weight:700; margin-bottom:6px;'>Rubric weights</div><div style='margin-bottom:16px; color:{mid_color};'>{esc(str(rubric_weights))}</div>",
-            "<div style='font-weight:700; margin-bottom:6px;'>Scoreboard</div>",
-            f"<ul style='margin-top:0; margin-bottom:16px;'>{ranking_rows}</ul>",
-        ]
-        if latency_rows:
-            html.extend([
-                "<div style='font-weight:700; margin-bottom:6px;'>Answer latencies</div>",
-                f"<ul style='margin-top:0; margin-bottom:16px;'>{latency_rows}</ul>",
-            ])
-        if note_rows:
-            html.extend([
-                "<div style='font-weight:700; margin-bottom:6px;'>Ballot notes</div>",
-                f"<ul style='margin-top:0; margin-bottom:16px;'>{note_rows}</ul>",
-            ])
-        html.extend([
-            "<div style='font-weight:700; margin-bottom:6px;'>Winning answer</div>",
-            f"<div style='padding:14px; border:1px solid {border_color}; border-radius:14px;'>{winner_answer_html}</div>",
-        ])
-        return "".join(html)
-
-    def _build_winner_html(self, winner: str, answer: str, tally: Dict[str, Any], details: Dict[str, Any]) -> str:
-        esc = escape_text if escape_text else (lambda value: str(value))
-        timings_ms = details.get("timings_ms", {}) or {}
-        timing = timings_ms.get(winner)
-        meta = [f"Score {tally.get(winner, 0)}"]
-        if isinstance(timing, (int, float)):
-            meta.append(f"{int(timing)} ms")
-        return f"""
-        <div style="font-size:22px; font-weight:800; margin-bottom:6px;">{esc(short_id(winner))}</div>
-        <div style="margin-bottom:14px; color:{self._palette_hex(QtGui.QPalette.Mid)};">{' · '.join(meta)}</div>
-        {self._safe_markdown_html(answer or "_No answer available._")}
-        """
-
-    def _build_ballots_html(self, answers: Dict[str, str], details: Dict[str, Any], tally: Dict[str, Any]) -> str:
-        esc = escape_text if escape_text else (lambda value: str(value))
-        valid_votes = details.get("valid_votes", {}) or {}
-        invalid_votes = details.get("invalid_votes", {}) or {}
-        vote_messages = details.get("vote_messages", {}) or {}
-        rubric_weights = normalize_rubric_weights(details.get("rubric_weights"))
-        sections = [
-            f"<div style='font-size:20px; font-weight:700; margin-bottom:8px;'>Ballots & Voting</div>",
-            f"<div style='margin-bottom:12px; color:{self._palette_hex(QtGui.QPalette.Mid)};'>Rubric: {esc(str(rubric_weights))}</div>",
-        ]
-        if tally:
-            sections.append("<div style='font-weight:700; margin-bottom:6px;'>Totals</div>")
-            sections.append("<ul style='margin-top:0; margin-bottom:16px;'>" + "".join(
-                f"<li><strong>{esc(short_id(model_id))}</strong> · {esc(str(tally[model_id]))}</li>"
-                for model_id in sorted(tally.keys(), key=lambda key: (-tally[key], key))
-            ) + "</ul>")
-        if valid_votes:
-            sections.append("<div style='font-weight:700; margin-bottom:6px;'>Valid ballots</div><ul style='margin-top:0; margin-bottom:16px;'>")
-            for voter, ballot in valid_votes.items():
-                ranked = []
-                for candidate in answers.keys():
-                    candidate_scores = ballot.get("scores", {}).get(candidate)
-                    if candidate_scores:
-                        weighted = sum(candidate_scores[k] * rubric_weights[k] for k in rubric_weights.keys())
-                        ranked.append(f"{esc(short_id(candidate))}: {weighted}")
-                sections.append(f"<li><strong>{esc(short_id(voter))}</strong> · {'; '.join(ranked)}</li>")
-            sections.append("</ul>")
-        if invalid_votes:
-            sections.append("<div style='font-weight:700; margin-bottom:6px;'>Invalid ballots</div><ul style='margin-top:0; margin-bottom:16px;'>")
-            for voter, message in invalid_votes.items():
-                sections.append(f"<li><strong>{esc(short_id(voter))}</strong> · {esc(message)}</li>")
-            sections.append("</ul>")
-        if vote_messages:
-            sections.append("<div style='font-weight:700; margin-bottom:6px;'>Notes</div><ul style='margin-top:0;'>")
-            for voter, message in vote_messages.items():
-                sections.append(f"<li><strong>{esc(short_id(voter))}</strong> · {esc(message)}</li>")
-            sections.append("</ul>")
-        return "".join(sections)
-
-    def _discussion_entry_html(self, entry: Dict[str, Any]) -> str:
-        esc = escape_text if escape_text else (lambda value: str(value))
-        agent = esc(entry.get("agent", "Unknown"))
-        persona = entry.get("persona")
-        message_html = self._safe_markdown_html(entry.get("message", ""))
-        border_color = self._palette_hex(QtGui.QPalette.Midlight)
-        alt_color = self._palette_hex(QtGui.QPalette.AlternateBase)
-        meta = f"{agent} [{esc(persona)}]" if persona else agent
-        turn = entry.get("turn", 0)
-        return f"""
-        <div style="margin-bottom:10px; padding:12px; border:1px solid {border_color}; border-radius:12px; background:{alt_color};">
-            <div style="font-weight:700; margin-bottom:6px;">Turn {turn} · {meta}</div>
-            <div>{message_html}</div>
-        </div>
-        """
-
-    def _build_discussion_transcript_html(self, transcript: List[Dict[str, Any]]) -> str:
-        if not transcript:
-            return self._placeholder_html(
-                "No Transcript Yet",
-                "Discussion turns will stream here as each agent responds.",
-            )
-        return "".join(self._discussion_entry_html(entry) for entry in transcript)
-
-    def _build_discussion_report_html(self, question: str, transcript: List[Dict[str, Any]], synthesis: Optional[str]) -> str:
-        esc = escape_text if escape_text else (lambda value: str(value))
-        border_color = self._palette_hex(QtGui.QPalette.Midlight)
-        alt_color = self._palette_hex(QtGui.QPalette.AlternateBase)
-        synthesis_html = self._safe_markdown_html(
-            synthesis if synthesis and synthesis.strip() else "Synthesis not available."
-        )
-        return f"""
-        <div style="font-size:20px; font-weight:700; margin-bottom:6px;">Discussion Report</div>
-        <div style="margin-bottom:14px; color:{self._palette_hex(QtGui.QPalette.Mid)};">{esc(question)}</div>
-        <div style="padding:12px; border:1px solid {border_color}; border-radius:12px; background:{alt_color}; margin-bottom:16px;">
-            <strong>Turns recorded</strong><br>{len(transcript)}
-        </div>
-        <div style="font-weight:700; margin-bottom:6px;">Final synthesis</div>
-        <div style="padding:14px; border:1px solid {border_color}; border-radius:14px; margin-bottom:16px;">{synthesis_html}</div>
-        <div style="font-weight:700; margin-bottom:6px;">Transcript</div>
-        {self._build_discussion_transcript_html(transcript)}
-        """
-
     def _handle_error(self, msg: str):
         self._busy(False)
         self.results_hint_label.setText("The last run failed. Review the status message and debug log for details.")
@@ -4346,21 +3933,43 @@ class CouncilWindow(QtWidgets.QMainWindow):
         # Refresh leaderboard list
         self._refresh_leaderboard()
 
-        # Compose results summary
-        valid_votes = details.get("valid_votes", {})
-        invalid_votes = details.get("invalid_votes", {})
-        vote_messages = details.get("vote_messages", {})
-        voters_used = details.get("voters_used", [])
         timings_ms = details.get("timings_ms", {})
-        rubric_weights = normalize_rubric_weights(details.get("rubric_weights"))
         self.results_overview_view.setHtml(
-            self._build_deliberation_summary_html(question, answers, winner, details, tally)
+            result_presenter.build_deliberation_summary_html(
+                question=question,
+                answers=answers,
+                winner=winner,
+                details=details,
+                tally=tally,
+                colors=self._surface_tokens(),
+                short_id=short_id,
+                safe_markdown_html=self._safe_markdown_html,
+                escape_text=escape_text,
+                normalize_rubric_weights=normalize_rubric_weights,
+            )
         )
         self.results_winner_view.setHtml(
-            self._build_winner_html(winner, answers.get(winner, ""), tally, details)
+            result_presenter.build_winner_html(
+                winner=winner,
+                answer=answers.get(winner, ""),
+                tally=tally,
+                details=details,
+                colors=self._surface_tokens(),
+                short_id=short_id,
+                safe_markdown_html=self._safe_markdown_html,
+                escape_text=escape_text,
+            )
         )
         self.results_ballots_view.setHtml(
-            self._build_ballots_html(answers, details, tally)
+            result_presenter.build_ballots_html(
+                answers=answers,
+                details=details,
+                tally=tally,
+                colors=self._surface_tokens(),
+                short_id=short_id,
+                escape_text=escape_text,
+                normalize_rubric_weights=normalize_rubric_weights,
+            )
         )
         self.results_discussion_view.setHtml(
             self._placeholder_html("Discussion", "Discussion mode is not active for this result.")
@@ -4405,14 +4014,32 @@ class CouncilWindow(QtWidgets.QMainWindow):
     def _handle_discussion_result(self, payload: object):
         """Handle result from Collaborative Discussion Mode."""
         mode, question, transcript, synthesis = payload
-        self.results_overview_view.setHtml(self._build_discussion_report_html(question, transcript, synthesis))
+        self.results_overview_view.setHtml(
+            result_presenter.build_discussion_report_html(
+                question=question,
+                transcript=transcript,
+                synthesis=synthesis,
+                colors=self._surface_tokens(),
+                safe_markdown_html=self._safe_markdown_html,
+                placeholder_html=self._placeholder_html,
+                escape_text=escape_text,
+            )
+        )
         self.results_winner_view.setHtml(
             self._placeholder_html("Winner", "Discussion mode does not produce a single vote winner.")
         )
         self.results_ballots_view.setHtml(
             self._placeholder_html("Ballots", "Discussion mode does not produce ballots.")
         )
-        self.results_discussion_view.setHtml(self._build_discussion_transcript_html(transcript))
+        self.results_discussion_view.setHtml(
+            result_presenter.build_discussion_transcript_html(
+                transcript=transcript,
+                colors=self._surface_tokens(),
+                safe_markdown_html=self._safe_markdown_html,
+                placeholder_html=self._placeholder_html,
+                escape_text=escape_text,
+            )
+        )
         self.selected_model_list.clear()
         self._refresh_selected_model_detail()
         

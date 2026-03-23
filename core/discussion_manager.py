@@ -34,7 +34,7 @@ class DiscussionManager:
         context_block: str = "",
         images: Optional[List[str]] = None,  # List of data URL image strings
         web_search_enabled: bool = False,
-        temperature: float = 0.7,
+        temperature: Optional[float] = None,
         status_callback: Optional[Callable[[str], None]] = None,
         update_callback: Optional[Callable[[Dict], None]] = None,
         max_turns: int = 10,
@@ -54,7 +54,7 @@ class DiscussionManager:
             context_block: Pre-formatted context from file parsing (if any)
             images: List of image data URLs
             web_search_enabled: Whether to enable web search tools
-            temperature: Model temperature
+            temperature: Optional model temperature override
             status_callback: Optional callback for status updates
             max_turns: Maximum number of discussion turns
             max_concurrency: Maximum concurrent model calls
@@ -81,6 +81,15 @@ class DiscussionManager:
         self.consensus_reached = False
         self.conversation_summary: str = ""  # Rolling summary of older conversation
         self.summarized_context: str = ""  # Summarized file context
+
+    def _apply_temperature(self, payload: Dict, provider_type: str, temperature: Optional[float]) -> Dict:
+        if temperature is None:
+            return payload
+        if provider_type == PROVIDER_OLLAMA:
+            payload["options"] = {"temperature": float(temperature)}
+        else:
+            payload["temperature"] = float(temperature)
+        return payload
 
     def _active_agents(self) -> List[Dict]:
         return [agent for agent in self.agents if agent.get("is_active", True)]
@@ -356,7 +365,6 @@ class DiscussionManager:
                 payload = {
                     "model": model,
                     "stream": False,
-                    "options": {"temperature": self.temperature},
                     "messages": [{"role": "user", "content": prompt}],
                 }
             else:
@@ -370,7 +378,6 @@ class DiscussionManager:
                 payload = {
                     "model": model,
                     "messages": messages,
-                    "temperature": self.temperature,
                 }
                 if self.web_search_enabled:
                     payload["tools"] = [{
@@ -385,6 +392,7 @@ class DiscussionManager:
                             },
                         },
                     }]
+            payload = self._apply_temperature(payload, provider_type, self.temperature)
 
             async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
                 if resp.status != 200:
@@ -551,16 +559,15 @@ Summary:"""
                 payload = {
                     "model": model,
                     "stream": False,
-                    "options": {"temperature": 0.3},
                     "messages": [{"role": "user", "content": summary_prompt}],
                 }
             else:
                 payload = {
                     "model": model,
                     "messages": [{"role": "user", "content": summary_prompt}],
-                    "temperature": 0.3,
                     "max_tokens": 200,
                 }
+            payload = self._apply_temperature(payload, provider_type, None)
             
             timeout = aiohttp.ClientTimeout(total=60)
             async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
@@ -788,15 +795,14 @@ Synthesis:"""
                 payload = {
                     "model": model,
                     "stream": False,
-                    "options": {"temperature": 0.5},
                     "messages": [{"role": "user", "content": synthesis_prompt}],
                 }
             else:
                 payload = {
                     "model": model,
                     "messages": [{"role": "user", "content": synthesis_prompt}],
-                    "temperature": 0.5,
                 }
+            payload = self._apply_temperature(payload, provider_type, None)
             
             timeout = aiohttp.ClientTimeout(total=180)  # Longer timeout for synthesis
             async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:

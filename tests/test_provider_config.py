@@ -4,11 +4,9 @@ from council import (
     PROVIDER_LM_STUDIO,
     PROVIDER_OLLAMA,
     PROVIDER_OPENAI_COMPAT,
-    endpoints,
     make_provider_config,
-    parse_models_response,
-    request_headers,
 )
+from core.api_client import endpoints, parse_models_response, request_headers
 
 
 def test_make_provider_config_defaults_and_normalization():
