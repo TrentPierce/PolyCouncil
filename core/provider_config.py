@@ -8,8 +8,8 @@ PROVIDER_OPENAI_COMPAT = "openai_compatible"
 PROVIDER_OLLAMA = "ollama"
 
 PROVIDER_LABELS = {
-    PROVIDER_LM_STUDIO: "LM Studio (OpenAI-compatible)",
-    PROVIDER_OPENAI_COMPAT: "OpenAI-compatible API",
+    PROVIDER_LM_STUDIO: "LM Studio",
+    PROVIDER_OPENAI_COMPAT: "Hosted API",
     PROVIDER_OLLAMA: "Ollama",
 }
 
@@ -17,12 +17,26 @@ API_SERVICE_CUSTOM = "custom"
 API_SERVICE_OPENAI = "openai"
 API_SERVICE_OPENROUTER = "openrouter"
 API_SERVICE_GEMINI = "gemini"
+API_SERVICE_ANTHROPIC = "anthropic"
+API_SERVICE_GROQ = "groq"
+API_SERVICE_TOGETHER = "together"
+API_SERVICE_KIMI = "kimi"
+API_SERVICE_MINIMAX = "minimax"
+API_SERVICE_ZAI = "zai"
+API_SERVICE_FIREWORKS = "fireworks"
 
 API_SERVICE_LABELS = {
     API_SERVICE_CUSTOM: "Custom",
     API_SERVICE_OPENAI: "OpenAI",
     API_SERVICE_OPENROUTER: "OpenRouter",
     API_SERVICE_GEMINI: "Google Gemini",
+    API_SERVICE_ANTHROPIC: "Anthropic",
+    API_SERVICE_GROQ: "Groq",
+    API_SERVICE_TOGETHER: "Together AI",
+    API_SERVICE_KIMI: "Kimi",
+    API_SERVICE_MINIMAX: "MiniMax",
+    API_SERVICE_ZAI: "Z.AI",
+    API_SERVICE_FIREWORKS: "Fireworks AI",
 }
 
 API_SERVICE_PRESETS = {
@@ -30,7 +44,26 @@ API_SERVICE_PRESETS = {
     API_SERVICE_OPENAI: {"base_url": "https://api.openai.com", "model_path": "v1/models"},
     API_SERVICE_OPENROUTER: {"base_url": "https://openrouter.ai/api/v1", "model_path": "models"},
     API_SERVICE_GEMINI: {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai", "model_path": "models"},
+    API_SERVICE_ANTHROPIC: {"base_url": "https://api.anthropic.com/v1", "model_path": "models"},
+    API_SERVICE_GROQ: {"base_url": "https://api.groq.com/openai/v1", "model_path": "models"},
+    API_SERVICE_TOGETHER: {"base_url": "https://api.together.xyz/v1", "model_path": "models"},
+    API_SERVICE_KIMI: {"base_url": "https://api.moonshot.ai/v1", "model_path": "models"},
+    API_SERVICE_MINIMAX: {"base_url": "https://api.minimax.io/v1", "model_path": "models"},
+    API_SERVICE_ZAI: {"base_url": "https://api.z.ai/api/paas/v4", "model_path": "models"},
+    API_SERVICE_FIREWORKS: {"base_url": "https://api.fireworks.ai/inference/v1", "model_path": "models"},
 }
+
+VERSIONED_OPENAI_BASE_SUFFIXES = (
+    "/v1",
+    "/v1beta",
+    "/v1beta/openai",
+    "/openai",
+    "/api/v1",
+    "/openai/v1",
+    "/inference/v1",
+    "/api/paas/v4",
+    "/api/coding/paas/v4",
+)
 
 
 @dataclass
@@ -58,6 +91,11 @@ def normalize_api_service(service: str) -> str:
 
 def service_preset(service: str) -> dict:
     return dict(API_SERVICE_PRESETS.get(normalize_api_service(service), API_SERVICE_PRESETS[API_SERVICE_CUSTOM]))
+
+
+def has_versioned_openai_base(base_url: str) -> bool:
+    cleaned = (base_url or "").strip().rstrip("/").lower()
+    return any(cleaned.endswith(suffix) for suffix in VERSIONED_OPENAI_BASE_SUFFIXES)
 
 
 def normalize_provider_type(provider_type: str) -> str:

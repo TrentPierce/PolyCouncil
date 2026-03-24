@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from typing import Any, Callable, List, Optional
 
@@ -11,11 +12,45 @@ from core.provider_config import (
     PROVIDER_LM_STUDIO,
     PROVIDER_OLLAMA,
     PROVIDER_OPENAI_COMPAT,
+    has_versioned_openai_base,
 )
 
 
 class ModelFetchError(RuntimeError):
     pass
+
+
+async def _emit_stream_chunk(
+    callback: Optional[Callable[[str], Any]],
+    chunk: str,
+) -> None:
+    if not callback or not chunk:
+        return
+    result = callback(chunk)
+    if inspect.isawaitable(result):
+        await result
+
+
+def _extract_openai_stream_delta(data: dict[str, Any]) -> str:
+    choices = data.get("choices", [])
+    if not isinstance(choices, list) or not choices:
+        return ""
+    delta = choices[0].get("delta", {})
+    if isinstance(delta, dict):
+        content = delta.get("content", "")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            )
+    message = choices[0].get("message", {})
+    if isinstance(message, dict):
+        content = message.get("content", "")
+        return content if isinstance(content, str) else ""
+    return ""
 
 
 def request_headers(provider: Any) -> dict[str, str]:
@@ -41,15 +76,7 @@ def endpoints(provider: Any) -> dict[str, str]:
             "models": f"{base_url}/api/tags",
         }
     model_path = provider.model_path or "v1/models"
-    lower = base_url.lower()
-    has_versioned_base = (
-        lower.endswith("/v1")
-        or lower.endswith("/v1beta")
-        or lower.endswith("/v1beta/openai")
-        or lower.endswith("/openai")
-        or lower.endswith("/api/v1")
-    )
-    if has_versioned_base:
+    if has_versioned_openai_base(base_url):
         chat_url = f"{base_url}/chat/completions"
         models_url = f"{base_url}/{(model_path or 'models').lstrip('/')}"
     else:
@@ -133,6 +160,8 @@ async def call_model(
     timeout_sec: int = 120,
     images: Optional[List[str]] = None,
     web_search: bool = False,
+    stream: bool = False,
+    stream_callback: Optional[Callable[[str], Any]] = None,
 ) -> Any:
     url = endpoints(provider)["chat"]
     timeout = aiohttp.ClientTimeout(total=timeout_sec)
@@ -143,7 +172,7 @@ async def call_model(
         assembled_prompt = user_prompt if not sys_prompt else f"{sys_prompt}\n\n{user_prompt}"
         payload: dict[str, Any] = {
             "model": model,
-            "stream": False,
+            "stream": bool(stream and stream_callback),
             "messages": [{"role": "user", "content": assembled_prompt}],
         }
         if temperature is not None:
@@ -152,9 +181,25 @@ async def call_model(
             debug_hook("CALL payload", {"provider": provider.provider_type, "url": url, "payload": payload})
         try:
             async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
-                text = await resp.text()
                 if resp.status != 200:
+                    text = await resp.text()
                     raise RuntimeError(f"HTTP {resp.status} for {model}:\n{text[:800]}")
+                if payload["stream"]:
+                    assembled = []
+                    async for raw_line in resp.content:
+                        line = raw_line.decode("utf-8", errors="ignore").strip()
+                        if not line:
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except Exception:
+                            continue
+                        chunk = data.get("message", {}).get("content", "")
+                        if isinstance(chunk, str) and chunk:
+                            assembled.append(chunk)
+                            await _emit_stream_chunk(stream_callback, chunk)
+                    return "".join(assembled)
+                text = await resp.text()
                 try:
                     data = json.loads(text)
                 except Exception as exc:
@@ -178,6 +223,8 @@ async def call_model(
         messages.append({"role": "user", "content": user_prompt})
 
     payload = {"model": model, "messages": messages}
+    if stream and stream_callback:
+        payload["stream"] = True
     if temperature is not None:
         payload["temperature"] = float(temperature)
     if json_schema:
@@ -200,9 +247,28 @@ async def call_model(
         debug_hook("CALL payload", {"provider": provider.provider_type, "url": url, "payload": payload})
     try:
         async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
-            text = await resp.text()
             if resp.status != 200:
+                text = await resp.text()
                 raise RuntimeError(f"HTTP {resp.status} for {model}:\n{text[:800]}")
+            if payload.get("stream"):
+                assembled: list[str] = []
+                async for raw_line in resp.content:
+                    line = raw_line.decode("utf-8", errors="ignore").strip()
+                    if not line or not line.startswith("data:"):
+                        continue
+                    data_text = line[5:].strip()
+                    if data_text == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(data_text)
+                    except Exception:
+                        continue
+                    chunk = _extract_openai_stream_delta(data)
+                    if chunk:
+                        assembled.append(chunk)
+                        await _emit_stream_chunk(stream_callback, chunk)
+                return "".join(assembled)
+            text = await resp.text()
             try:
                 data = json.loads(text)
             except Exception as exc:

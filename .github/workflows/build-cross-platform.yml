@@ -41,7 +41,7 @@ jobs:
 
       - name: Build executable
         run: |
-          python -m PyInstaller council.py --name PolyCouncil --clean --noconfirm --windowed --onefile
+          python -m PyInstaller build_exe.spec --clean --noconfirm
 
       - name: Package artifact (Windows)
         if: runner.os == 'Windows'

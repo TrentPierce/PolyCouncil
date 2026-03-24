@@ -30,11 +30,6 @@ DEFAULT_PERSONAS: List[dict] = [
         "builtin": True,
     },
     {
-        "name": "Structured Data Analyst",
-        "prompt": "You are a data analyst. Structure answers into bullets, highlight assumptions and limits.",
-        "builtin": True,
-    },
-    {
         "name": "Systems thinker",
         "prompt": "You are a systems thinker. Map long-term interactions and consequences.",
         "builtin": True,

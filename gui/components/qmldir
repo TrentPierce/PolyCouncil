@@ -1,0 +1,8 @@
+module components
+singleton Theme Theme.qml
+GlassPanel GlassPanel.qml
+Eyebrow Eyebrow.qml
+SoftBadge SoftBadge.qml
+AppButton AppButton.qml
+ModeButton ModeButton.qml
+SectionTitle SectionTitle.qml

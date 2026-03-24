@@ -12,6 +12,8 @@ from pathlib import Path
 import aiohttp
 
 from core.app_state import app_config_dir
+from core.api_client import call_model
+from core.provider_config import has_versioned_openai_base
 
 PROVIDER_LM_STUDIO = "lm_studio"
 PROVIDER_OPENAI_COMPAT = "openai_compatible"
@@ -142,15 +144,7 @@ class DiscussionManager:
         base = base_url.rstrip("/")
         if provider_type == PROVIDER_OLLAMA:
             return f"{base}/api/chat"
-        lower = base.lower()
-        has_versioned_base = (
-            lower.endswith("/v1")
-            or lower.endswith("/v1beta")
-            or lower.endswith("/v1beta/openai")
-            or lower.endswith("/openai")
-            or lower.endswith("/api/v1")
-        )
-        if has_versioned_base:
+        if has_versioned_openai_base(base):
             return f"{base}/chat/completions"
         return f"{base}/v1/chat/completions"
     
@@ -352,7 +346,8 @@ class DiscussionManager:
         self,
         session: aiohttp.ClientSession,
         agent: Dict,
-        conversation_history: List[Dict]
+        conversation_history: List[Dict],
+        turn_number: int,
     ) -> Optional[str]:
         """Call a single agent in the discussion."""
         model = agent.get("model")
@@ -363,53 +358,42 @@ class DiscussionManager:
         
         try:
             provider_type, _, _, _ = self._agent_provider(agent)
-            url = self._chat_url(agent)
-            headers = self._headers(agent)
-            timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
-            if provider_type == PROVIDER_OLLAMA:
-                payload = {
-                    "model": model,
-                    "stream": False,
-                    "messages": [{"role": "user", "content": prompt}],
-                }
-            else:
-                if self.images:
-                    content_list = [{"type": "text", "text": prompt}]
-                    for image_url in self.images:
-                        content_list.append({"type": "image_url", "image_url": {"url": image_url}})
-                    messages = [{"role": "user", "content": content_list}]
-                else:
-                    messages = [{"role": "user", "content": prompt}]
-                payload = {
-                    "model": model,
-                    "messages": messages,
-                }
-                if self.web_search_enabled:
-                    payload["tools"] = [{
-                        "type": "function",
-                        "function": {
-                            "name": "google_search",
-                            "description": "Search the web for current information.",
-                            "parameters": {
-                                "type": "object",
-                                "properties": {"query": {"type": "string", "description": "The search query"}},
-                                "required": ["query"],
-                            },
-                        },
-                    }]
-            payload = self._apply_temperature(payload, provider_type, self.temperature)
+            _, base_url, api_key, model_path = self._agent_provider(agent)
+            provider = type("Provider", (), {
+                "provider_type": provider_type,
+                "base_url": base_url,
+                "api_key": api_key,
+                "model_path": model_path,
+                "api_service": agent.get("api_service", "custom"),
+            })()
+            streamed_parts: list[str] = []
 
-            async with session.post(url, json=payload, headers=headers, timeout=timeout) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    raise RuntimeError(f"HTTP {resp.status}: {text[:800]}")
-                
-                data = await resp.json()
-                if provider_type == PROVIDER_OLLAMA:
-                    content = data.get("message", {}).get("content", "")
-                else:
-                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                return content
+            async def on_stream_chunk(chunk: str) -> None:
+                streamed_parts.append(chunk)
+                if self.update_callback:
+                    self.update_callback(
+                        {
+                            "turn": turn_number,
+                            "agent": agent.get("name", model),
+                            "model": model,
+                            "persona": agent.get("persona_name"),
+                            "message": "".join(streamed_parts),
+                            "partial": True,
+                        }
+                    )
+
+            return await call_model(
+                session,
+                provider,
+                model,
+                prompt,
+                temperature=self.temperature,
+                images=self.images,
+                web_search=self.web_search_enabled,
+                timeout_sec=self.timeout_seconds,
+                stream=True,
+                stream_callback=on_stream_chunk,
+            )
                 
         except Exception:
             LOGGER.exception("Error calling agent %s", agent.get("name", model))
@@ -636,7 +620,7 @@ Summary:"""
                 
                 async def call_with_semaphore(agent):
                     async with semaphore:
-                        return await self._call_agent(session, agent, conversation_history)
+                        return await self._call_agent(session, agent, conversation_history, self.turn_count)
                 
                 tasks = [call_with_semaphore(agent) for agent in active_agents]
                 responses = await asyncio.gather(*tasks)

@@ -717,7 +717,8 @@ async def council_round(
     temperature: Optional[float] = None,
     rubric_weights: Optional[Dict[str, int]] = None,
     timeout_seconds: int = 120,
-    is_cancelled: Optional[Callable[[], bool]] = None
+    is_cancelled: Optional[Callable[[], bool]] = None,
+    answer_stream_cb: Optional[Callable[[str, str, bool], None]] = None,
 ):
     status_cb("Collecting answers…")
     async with aiohttp.ClientSession() as session:
@@ -735,19 +736,29 @@ async def council_round(
             sys_p = roles.get(model_id) or None
             started_at = datetime.datetime.now()
             try:
+                async def on_stream_chunk(chunk: str) -> None:
+                    if answer_stream_cb:
+                        answer_stream_cb(model_id, chunk, False)
+
                 ans = await call_model(
                     session, provider, raw_model, user_prompt,
                     debug_hook=_dbg,
                     temperature=temperature, sys_prompt=sys_p,
                     images=images, web_search=web_search,
                     timeout_sec=timeout_seconds,
+                    stream=bool(answer_stream_cb),
+                    stream_callback=on_stream_chunk if answer_stream_cb else None,
                 )
                 if isinstance(ans, dict):
                     ans = json.dumps(ans, ensure_ascii=False)
                 elapsed_ms = int((datetime.datetime.now() - started_at).total_seconds() * 1000)
+                if answer_stream_cb:
+                    answer_stream_cb(model_id, "", True)
                 return model_id, ans, elapsed_ms
             except Exception as e1:
                 elapsed_ms = int((datetime.datetime.now() - started_at).total_seconds() * 1000)
+                if answer_stream_cb:
+                    answer_stream_cb(model_id, "", True)
                 return model_id, f"[ERROR fetching answer]\n{e1}", elapsed_ms
 
         # Check cancellation before starting
@@ -763,44 +774,89 @@ async def council_round(
         answers = {m: a for m, a, _ in pairs}
         timings_ms = {m: elapsed for m, _, elapsed in pairs}
         errors = {m: a for m, a, _ in pairs if isinstance(a, str) and a.startswith("[ERROR")}
+        cancelled = {m: a for m, a, _ in pairs if isinstance(a, str) and a.startswith("[Cancelled]")}
+
+        if errors:
+            status_cb(f"⚠ {len(errors)}/{len(model_entries)} models failed to answer: {', '.join(short_id(m) for m in errors)}")
 
         status_cb("Models are voting…")
 
         model_entry_by_id = {str(m["id"]): m for m in model_entries}
-        selected_model_ids = list(model_entry_by_id.keys())
-        voters_to_use = voter_override if voter_override else selected_model_ids
-        # Note: Voting phase does not use images or web search, typically.
-        vote_results = await run_limited(
-            max_concurrency,
-            [
-                lambda m=m: vote_one(session, model_entry_by_id[m], question, answers, model_entries)
-                for m in voters_to_use if m in model_entry_by_id
-            ]
-        )
+        successful_model_ids = [
+            model_id
+            for model_id, answer_text, _elapsed in pairs
+            if not (
+                isinstance(answer_text, str)
+                and (answer_text.startswith("[ERROR") or answer_text.startswith("[Cancelled]"))
+            )
+        ]
+        candidate_model_ids = [model_id for model_id in successful_model_ids if model_id in model_entry_by_id]
+        candidate_answers = {model_id: answers[model_id] for model_id in candidate_model_ids}
+        candidate_entries = [model_entry_by_id[model_id] for model_id in candidate_model_ids]
 
+        if not candidate_model_ids:
+            status_cb("⚠ No successful model answers were returned, so no winner was selected.")
+            details = {
+                "question": question,
+                "answers": answers,
+                "valid_votes": {},
+                "invalid_votes": {},
+                "vote_messages": {},
+                "tally": {},
+                "errors": errors,
+                "cancelled": cancelled,
+                "timings_ms": timings_ms,
+                "rubric_weights": weights,
+                "winner": "",
+                "participation_rate": 0.0,
+                "voters_used": [],
+                "candidate_models": [],
+            }
+            return answers, "", details, {}
+
+        voters_to_use = (
+            [model_id for model_id in voter_override if model_id in candidate_model_ids]
+            if voter_override
+            else list(candidate_model_ids)
+        )
+        # Note: Voting phase does not use images or web search, typically.
         valid_votes: Dict[str, dict] = {}
         invalid_votes: Dict[str, str] = {}
         vote_messages: Dict[str, str] = {}
 
-        for voter_id, ballot, msg in vote_results:
-            vote_messages[voter_id] = msg
-            if ballot is not None:
-                valid_votes[voter_id] = ballot
-            else:
-                invalid_votes[voter_id] = msg
+        if len(candidate_model_ids) > 1 and voters_to_use:
+            vote_results = await run_limited(
+                max_concurrency,
+                [
+                    lambda m=m: vote_one(session, model_entry_by_id[m], question, candidate_answers, candidate_entries)
+                    for m in voters_to_use if m in model_entry_by_id
+                ]
+            )
+
+            for voter_id, ballot, msg in vote_results:
+                vote_messages[voter_id] = msg
+                if ballot is not None:
+                    valid_votes[voter_id] = ballot
+                else:
+                    invalid_votes[voter_id] = msg
+        else:
+            if len(candidate_model_ids) == 1:
+                status_cb(f"Only one model returned a usable answer: {short_id(candidate_model_ids[0])}")
+            elif not voters_to_use:
+                status_cb("⚠ No eligible voters produced a usable answer.")
 
         if invalid_votes:
             status_cb(f"⚠ {len(invalid_votes)}/{len(voters_to_use)} invalid ballots: {', '.join(short_id(m) for m in invalid_votes)}")
 
-        totals: Dict[str, int] = {mid: 0 for mid in selected_model_ids}
+        totals: Dict[str, int] = {mid: 0 for mid in candidate_model_ids}
         for ballot in valid_votes.values():
             for candidate_mid, score_dict in ballot["scores"].items():
                 weighted = sum(score_dict[k] * weights[k] for k in weights.keys())
                 totals[candidate_mid] = totals.get(candidate_mid, 0) + int(weighted)
 
         if not valid_votes:
-            status_cb("⚠ NO VALID VOTES - selecting first model by default (consider checking model compatibility)")
-            winner = selected_model_ids[0]
+            status_cb("⚠ No valid ballots were produced, selecting the first successful answer by default.")
+            winner = candidate_model_ids[0]
         else:
             max_score = max(totals.values())
             contenders = [m for m, score in totals.items() if score == max_score]
@@ -820,11 +876,13 @@ async def council_round(
             "vote_messages": vote_messages,
             "tally": tally,
             "errors": errors,
+            "cancelled": cancelled,
             "timings_ms": timings_ms,
             "rubric_weights": weights,
             "winner": winner,
             "participation_rate": len(valid_votes) / max(1, len(voters_to_use)),
             "voters_used": voters_to_use,
+            "candidate_models": candidate_model_ids,
         }
 
         status_cb(f"Vote complete. Valid: {len(valid_votes)}/{len(voters_to_use)}")

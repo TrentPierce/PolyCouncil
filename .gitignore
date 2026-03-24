@@ -1,6 +1,20 @@
-# --- PolyCouncil extras ---
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.mypy_cache/
+.pytest_cache/
+pytest-cache-files-*
 
-# Secrets & local config
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local secrets and runtime state
+.env
 .env.*
 .secrets/
 *.pem
@@ -10,20 +24,21 @@
 *service_account*.json
 auth.json
 token.json
+council_settings.json
+council_stats.db
+config/user_personas.json
 
-# Databases & caches (generic)
-*.db
-*.sqlite
-*.sqlite3
-*.db-journal
-
-# Logs (generic/rotating)
+# Logs and temp files
 logs/
 *.log
 *.log.*
-polycouncil_crash.log
+tmp/
+temp/
+*.tmp
+*.swp
+*.swo
 
-# Models / weights / large artifacts
+# Large local artifacts
 models/
 weights/
 checkpoints/
@@ -36,7 +51,18 @@ artifacts/
 *.bin
 *.onnx
 
-# Optional build outputs for JS/TS frontends
+# PyInstaller and local release outputs
+build/
+build_*/
+dist/
+dist_*/
+.release-artifacts/
+*.spec.bak
+
+# Editor/project files
+*.code-workspace
+
+# Frontend/package manager caches
 node_modules/
 .vite/
 .parcel-cache/
@@ -45,66 +71,10 @@ node_modules/
 .nuxt/
 .svelte-kit/
 .vercel/
-coverage/          # if you use JS coverage; Python coverage already handled
+coverage/
 
-# Temporary and scratch
-tmp/
-temp/
-*.tmp
-.tmp-*/
-.release-artifacts/
-dist_profiles/
-*.swp
-*.swo
-.pytest_cache/
-pytest-cache-files-*
-
-# Editors / workspace
-*.code-workspace
-
-# Build artifacts (PyInstaller)
-build/
-dist/
-dist_test/
-dist_test2/
-*.spec
-*.spec.bak
-*.pyc
-__pycache__/
-*.pyo
-*.pyd
-.Python
-
-# Build scripts and tools
-*.bat
-build*.py
-check_*.py
-clear_*.py
-embed_*.py
-fix_*.py
-generate_*.py
-refresh_*.py
-test_*.py
-!tests/test_*.py
-
-# Icons and resources (keep only essential)
-*.ico
-*.png
-!docs/*.png
-*.rc
-PolyCouncil.rc
-
-# Build documentation
-README_BUILD.md
-README_ICON_FIX.md
-
-# Database files
-*.db
-*.sqlite
-*.sqlite3
-*.db-journal
-council_stats.db
-
-# User runtime state
-council_settings.json
-config/user_personas.json
+# Local scratch images and generated checks
+gui-redesign-check.png
+gui-state-pass.png
+gui-state-pass-2.png
+tmp-ui-check.png
