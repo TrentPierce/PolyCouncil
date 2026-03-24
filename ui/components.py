@@ -281,6 +281,25 @@ class AnimatedStatusBar(QtWidgets.QWidget):
         layout.addWidget(self.message, 1)
         layout.addWidget(self.footer_link, 0)
 
+    def set_status(self, text: str) -> None:
+        self.message.setText(text)
+        lowered = text.lower()
+        if any(word in lowered for word in ("error", "failed")):
+            self.badge.setText("Error")
+            self._set_badge_tone("error")
+        elif any(word in lowered for word in ("warning", "select", "unavailable", "no ")) and not self.progress.isVisible():
+            self.badge.setText("Attention")
+            self._set_badge_tone("warn")
+        elif self.progress.isVisible():
+            self.badge.setText("Working")
+            self._set_badge_tone("busy")
+        elif any(word in lowered for word in ("done", "ready", "complete", "saved", "added", "found", "loaded", "updated", "cleared")):
+            self.badge.setText("Ready")
+            self._set_badge_tone("success")
+        else:
+            self.badge.setText("Info")
+            self._set_badge_tone("neutral")
+
     def set_busy(self, on: bool) -> None:
         self.progress.setVisible(on)
         self.progress.setMaximum(0 if on else 1)
