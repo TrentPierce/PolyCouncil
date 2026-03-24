@@ -26,6 +26,7 @@ from constants import (
     make_monospace_font,
 )
 from ui.animations import FadeIn, FadeOut, SmoothCollapse
+from ui.theme import apply_shadow
 from ui.factories import configure_tooltip
 
 
@@ -76,6 +77,7 @@ class CollapsibleGroupBox(QtWidgets.QWidget):
         outer.addWidget(self._frame)
 
         self._header.mousePressEvent = self._on_header_click
+        apply_shadow(self._frame, blur_radius=12, y_offset=4, alpha=15)
         if start_collapsed:
             self._content.hide()
             self._content.setMaximumHeight(0)
@@ -143,6 +145,8 @@ class ToastNotification(QtWidgets.QFrame):
         self._dismiss_timer = QtCore.QTimer(self)
         self._dismiss_timer.setSingleShot(True)
         self._dismiss_timer.timeout.connect(self._dismiss)
+        
+        apply_shadow(self, blur_radius=32, y_offset=12, alpha=25)
 
     def show_toast(self) -> None:
         parent = self.parentWidget()
@@ -443,6 +447,7 @@ class WorkflowStepCard(QtWidgets.QWidget):
         self.header.mousePressEvent = self._handle_header_click
         self.set_state(self.IDLE)
         self.set_collapsed(start_collapsed, animate=False)
+        apply_shadow(self, blur_radius=16, y_offset=8, alpha=20)
 
     def add_widget(self, widget: QtWidgets.QWidget) -> None:
         self.content_layout.addWidget(widget)
@@ -521,6 +526,7 @@ class OnboardingOverlay(QtWidgets.QWidget):
 
         self._card = QtWidgets.QFrame(self)
         self._card.setObjectName("OnboardingCard")
+        apply_shadow(self._card, blur_radius=64, y_offset=24, alpha=40)
         card_layout = QtWidgets.QVBoxLayout(self._card)
         card_layout.setContentsMargins(dp(SECTION_GAP), dp(SECTION_GAP), dp(SECTION_GAP), dp(PADDING_LG))
         card_layout.setSpacing(dp(INTERNAL_GAP))
@@ -626,6 +632,7 @@ class KeyboardShortcutOverlay(QtWidgets.QWidget):
 
         self._card = QtWidgets.QFrame(self)
         self._card.setObjectName("OverlayCard")
+        apply_shadow(self._card, blur_radius=56, y_offset=24, alpha=40)
         card_layout = QtWidgets.QVBoxLayout(self._card)
         card_layout.setContentsMargins(dp(SECTION_GAP), dp(PADDING_LG), dp(SECTION_GAP), dp(PADDING_LG))
         card_layout.setSpacing(dp(PADDING_MD))

@@ -117,6 +117,18 @@ def toggle_theme(root: QtWidgets.QWidget, engine: Optional["ThemeEngine"] = None
     return dict(THEME)
 
 
+def apply_shadow(widget: QtWidgets.QWidget, engine: Optional["ThemeEngine"] = None, blur_radius: int = 24, y_offset: int = 8, alpha: int = 20) -> None:
+    theme_engine = engine or getattr(widget.window(), "_theme_engine", None)
+    is_dark = theme_engine.is_dark if theme_engine else True
+    
+    shadow = QtWidgets.QGraphicsDropShadowEffect(widget)
+    shadow.setBlurRadius(dp(blur_radius))
+    shadow.setXOffset(0)
+    shadow.setYOffset(dp(y_offset))
+    shadow.setColor(QtGui.QColor(0, 0, 0, int(alpha * 2) if is_dark else alpha))
+    widget.setGraphicsEffect(shadow)
+
+
 class ThemeEngine(QtCore.QObject):
     themeChanged = QtCore.Signal()
 
@@ -292,9 +304,10 @@ class ThemeEngine(QtCore.QObject):
         QComboBox,
         QSpinBox,
         QTextEdit {{
-            background-color: {t.bg_secondary};
+            background-color: {t.bg_primary};
             color: {t.fg_primary};
             border: 1px solid {t.border};
+            border-bottom: 2px solid {t.border_strong};
             border-radius: {dp(CORNER_RADIUS_SM)}px;
             padding: {dp(PADDING_SM)}px {dp(PADDING_MD)}px;
             selection-background-color: {t.accent};
@@ -325,7 +338,8 @@ class ThemeEngine(QtCore.QObject):
         QPushButton:focus,
         QCheckBox:focus,
         QRadioButton:focus {{
-            border: {max(1, int(FOCUS_RING_WIDTH * DPI_SCALE))}px solid {t.accent};
+            border: 1px solid {t.accent};
+            border-bottom: 2px solid {t.accent};
             outline: none;
         }}
         QPushButton {{
@@ -441,7 +455,7 @@ class ThemeEngine(QtCore.QObject):
             margin-bottom: {dp(PADDING_SM)}px;
         }}
         QWidget#SidebarCol {{
-            min-width: {dp(180)}px;
+            background-color: transparent;
         }}
         QScrollBar:vertical {{
             background-color: {t.bg_primary};

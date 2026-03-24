@@ -1113,9 +1113,9 @@ class CouncilWindow(QtWidgets.QMainWindow):
         hero_layout.addLayout(badge_row)
         layout.addWidget(hero)
 
-        shell = QtWidgets.QHBoxLayout()
-        shell.setContentsMargins(0, 0, 0, 0)
-        shell.setSpacing(dp(INTERNAL_GAP))
+        shell = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        shell.setChildrenCollapsible(False)
+        shell.setObjectName("MainSplitter")
 
         sidebar_col = QtWidgets.QWidget()
         sidebar_col.setObjectName("SidebarCol")
@@ -1599,10 +1599,13 @@ class CouncilWindow(QtWidgets.QMainWindow):
         self.right_panel_stack.addWidget(post_run_page)
         results_layout.addWidget(self.right_panel_stack, 1)
 
-        shell.addWidget(sidebar_scroll, 0)
-        shell.addWidget(workspace_col, 1)
-        shell.addWidget(results_scroll, 0)
-        layout.addLayout(shell, stretch=1)
+        shell.addWidget(sidebar_scroll)
+        shell.addWidget(workspace_col)
+        shell.addWidget(results_scroll)
+        shell.setStretchFactor(0, 0)
+        shell.setStretchFactor(1, 1)
+        shell.setStretchFactor(2, 0)
+        layout.addWidget(shell, 1)
 
         bottom = QtWidgets.QHBoxLayout()
         bottom.setContentsMargins(0, 0, 0, 0)

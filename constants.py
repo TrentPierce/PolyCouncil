@@ -18,12 +18,12 @@ TOOLBAR_BUTTON_GAP = 2
 
 MIN_W = 640
 MIN_H = 480
-MIN_SIDEBAR = 180
+MIN_SIDEBAR = 220
 MIN_TOUCH_TARGET = 44
 FOCUS_RING_WIDTH = 2
-CORNER_RADIUS_SM = 4
-CORNER_RADIUS_MD = 8
-CORNER_RADIUS_LG = 16
+CORNER_RADIUS_SM = 6
+CORNER_RADIUS_MD = 12
+CORNER_RADIUS_LG = 20
 TOOLTIP_MAX_WIDTH = 260
 TOOLTIP_SHOW_DELAY_MS = 600
 TOOLTIP_HIDE_DELAY_MS = 200
@@ -36,9 +36,9 @@ FONT_LG = 16
 FONT_XL = 20
 FONT_DISPLAY = 24
 LINE_HEIGHT_MULTIPLIER = 1.4
-MONOSPACE_FONT_FAMILY = "Consolas"
-BODY_FONT_FAMILY = "Segoe UI"
-HEADING_FONT_FAMILY = "Bahnschrift SemiBold"
+MONOSPACE_FONT_FAMILY = "JetBrains Mono"
+BODY_FONT_FAMILY = "Inter"
+HEADING_FONT_FAMILY = "Inter SemiBold"
 
 WINDOW_ICON_SIZE = 32
 TOOLBAR_ICON_SIZE = 20
@@ -47,43 +47,43 @@ DIALOG_ICON_SIZE = 32
 
 
 LIGHT_THEME: dict[str, str] = {
-    "bg_primary": "#fafafa",
-    "bg_secondary": "#ffffff",
-    "bg_tertiary": "#f4f4f5",
-    "fg_primary": "#09090b",
-    "fg_secondary": "#3f3f46",
-    "fg_muted": "#71717a",
-    "accent": "#2563eb",
-    "accent_hover": "#1d4ed8",
-    "accent_fg": "#ffffff",
-    "border": "#e4e4e7",
-    "border_strong": "#d4d4d8",
-    "danger": "#dc2626",
-    "danger_fg": "#ffffff",
-    "warning": "#f59e0b",
-    "warning_fg": "#111827",
-    "success": "#16a34a",
-    "success_fg": "#ffffff",
+    "bg_primary": "#F7F8FA",
+    "bg_secondary": "#FFFFFF",
+    "bg_tertiary": "#F0F2F5",
+    "fg_primary": "#0F1115",
+    "fg_secondary": "#474D57",
+    "fg_muted": "#8A92A3",
+    "accent": "#0066FF",
+    "accent_hover": "#0052CC",
+    "accent_fg": "#FFFFFF",
+    "border": "#E2E5EB",
+    "border_strong": "#CDD2DE",
+    "danger": "#F04438",
+    "danger_fg": "#FFFFFF",
+    "warning": "#F7B223",
+    "warning_fg": "#101828",
+    "success": "#12B76A",
+    "success_fg": "#FFFFFF",
 }
 
 DARK_THEME: dict[str, str] = {
-    "bg_primary": "#09090b",
-    "bg_secondary": "#18181b",
-    "bg_tertiary": "#27272a",
-    "fg_primary": "#fafafa",
-    "fg_secondary": "#d4d4d8",
-    "fg_muted": "#a1a1aa",
-    "accent": "#60a5fa",
-    "accent_hover": "#3b82f6",
-    "accent_fg": "#020617",
-    "border": "#27272a",
-    "border_strong": "#3f3f46",
-    "danger": "#f87171",
-    "danger_fg": "#1f0a0a",
-    "warning": "#fbbf24",
+    "bg_primary": "#09090B",
+    "bg_secondary": "#111114",
+    "bg_tertiary": "#1B1B1F",
+    "fg_primary": "#FAFAFA",
+    "fg_secondary": "#D4D4D8",
+    "fg_muted": "#A1A1AA",
+    "accent": "#3E8BFF",
+    "accent_hover": "#2B68E0",
+    "accent_fg": "#040B1A",
+    "border": "#27272A",
+    "border_strong": "#3F3F46",
+    "danger": "#F97066",
+    "danger_fg": "#1F0A0A",
+    "warning": "#FDB022",
     "warning_fg": "#111827",
-    "success": "#4ade80",
-    "success_fg": "#052e16",
+    "success": "#32D583",
+    "success_fg": "#052E16",
 }
 
 THEME: dict[str, str] = dict(DARK_THEME)
