@@ -37,6 +37,8 @@ FONT_XL = 20
 FONT_DISPLAY = 24
 LINE_HEIGHT_MULTIPLIER = 1.4
 MONOSPACE_FONT_FAMILY = "Consolas"
+BODY_FONT_FAMILY = "Segoe UI"
+HEADING_FONT_FAMILY = "Bahnschrift SemiBold"
 
 WINDOW_ICON_SIZE = 32
 TOOLBAR_ICON_SIZE = 20
@@ -45,43 +47,43 @@ DIALOG_ICON_SIZE = 32
 
 
 LIGHT_THEME: dict[str, str] = {
-    "bg_primary": "#f4f7fb",
+    "bg_primary": "#fafafa",
     "bg_secondary": "#ffffff",
-    "bg_tertiary": "#e8eef5",
-    "fg_primary": "#17212b",
-    "fg_secondary": "#425466",
-    "fg_muted": "#66778a",
-    "accent": "#0f62fe",
-    "accent_hover": "#0a53d6",
+    "bg_tertiary": "#f4f4f5",
+    "fg_primary": "#09090b",
+    "fg_secondary": "#3f3f46",
+    "fg_muted": "#71717a",
+    "accent": "#2563eb",
+    "accent_hover": "#1d4ed8",
     "accent_fg": "#ffffff",
-    "border": "#c9d5e3",
-    "border_strong": "#8ea4bb",
-    "danger": "#c62828",
+    "border": "#e4e4e7",
+    "border_strong": "#d4d4d8",
+    "danger": "#dc2626",
     "danger_fg": "#ffffff",
-    "warning": "#b26a00",
-    "warning_fg": "#1f1300",
-    "success": "#1d7a3f",
+    "warning": "#f59e0b",
+    "warning_fg": "#111827",
+    "success": "#16a34a",
     "success_fg": "#ffffff",
 }
 
 DARK_THEME: dict[str, str] = {
-    "bg_primary": "#0f1720",
-    "bg_secondary": "#17212b",
-    "bg_tertiary": "#22303d",
-    "fg_primary": "#f2f6fb",
-    "fg_secondary": "#c1cfdd",
-    "fg_muted": "#8ea2b8",
-    "accent": "#58a6ff",
-    "accent_hover": "#7ab8ff",
-    "accent_fg": "#08131d",
-    "border": "#314255",
-    "border_strong": "#51657a",
-    "danger": "#ff6b6b",
-    "danger_fg": "#1f0d0d",
-    "warning": "#f4b860",
-    "warning_fg": "#261800",
-    "success": "#5dd39e",
-    "success_fg": "#062116",
+    "bg_primary": "#09090b",
+    "bg_secondary": "#18181b",
+    "bg_tertiary": "#27272a",
+    "fg_primary": "#fafafa",
+    "fg_secondary": "#d4d4d8",
+    "fg_muted": "#a1a1aa",
+    "accent": "#60a5fa",
+    "accent_hover": "#3b82f6",
+    "accent_fg": "#020617",
+    "border": "#27272a",
+    "border_strong": "#3f3f46",
+    "danger": "#f87171",
+    "danger_fg": "#1f0a0a",
+    "warning": "#fbbf24",
+    "warning_fg": "#111827",
+    "success": "#4ade80",
+    "success_fg": "#052e16",
 }
 
 THEME: dict[str, str] = dict(DARK_THEME)
@@ -150,7 +152,7 @@ def make_font(
     italic: bool = False,
     family: str | None = None,
 ) -> QtGui.QFont:
-    font = QtGui.QFont(family or "")
+    font = QtGui.QFont(family or BODY_FONT_FAMILY)
     font.setPointSizeF(float(point_size))
     font.setBold(bold)
     font.setItalic(italic)

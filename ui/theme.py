@@ -18,12 +18,14 @@ from constants import (
     CORNER_RADIUS_SM,
     DARK_THEME,
     DPI_SCALE,
+    BODY_FONT_FAMILY,
     FOCUS_RING_WIDTH,
     FONT_BASE,
     FONT_DISPLAY,
     FONT_LG,
     FONT_SM,
     FONT_XS,
+    HEADING_FONT_FAMILY,
     INTERNAL_GAP,
     LIGHT_THEME,
     MIN_TOUCH_TARGET,
@@ -138,7 +140,7 @@ class ThemeEngine(QtCore.QObject):
 
     @property
     def font_family(self) -> str:
-        return QtWidgets.QApplication.font().family()
+        return BODY_FONT_FAMILY
 
     @property
     def contrast_failures(self):
@@ -183,6 +185,7 @@ class ThemeEngine(QtCore.QObject):
             background-color: {t.bg_primary};
         }}
         QLabel#HeroTitle {{
+            font-family: "{HEADING_FONT_FAMILY}", "{base_font}", sans-serif;
             font-size: {FONT_DISPLAY}pt;
             font-weight: 700;
             color: {t.fg_primary};
@@ -206,6 +209,7 @@ class ThemeEngine(QtCore.QObject):
         }}
         QLabel#PanelTitle,
         QLabel#WorkflowStepTitle {{
+            font-family: "{HEADING_FONT_FAMILY}", "{base_font}", sans-serif;
             font-size: {FONT_LG}pt;
             font-weight: 700;
             color: {t.fg_primary};
@@ -265,6 +269,15 @@ class ThemeEngine(QtCore.QObject):
             background-color: {t.bg_secondary};
             border: 1px solid {t.border};
             border-radius: {dp(CORNER_RADIUS_MD)}px;
+        }}
+        QFrame#HeroCard {{
+            border-color: {t.border_strong};
+        }}
+        QFrame#PanelCard,
+        QFrame#ComposerCard,
+        QWidget#WorkflowStepCard,
+        QWidget#ModelRow {{
+            background-color: {t.bg_secondary};
         }}
         QDockWidget::title {{
             padding: {dp(PADDING_MD)}px {dp(PADDING_LG)}px;
@@ -343,9 +356,13 @@ class ThemeEngine(QtCore.QObject):
         }}
         QPushButton#SecondaryButton,
         QPushButton#GhostButton {{
+            background-color: {t.bg_tertiary};
+            color: {t.fg_primary};
+            border-color: {t.border};
+        }}
+        QPushButton#GhostButton {{
             background-color: transparent;
-            color: {t.accent};
-            border-color: {t.accent};
+            color: {t.fg_secondary};
         }}
         QPushButton#DangerButton {{
             background-color: {t.danger};

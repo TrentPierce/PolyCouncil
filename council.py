@@ -27,6 +27,7 @@ from constants import (
     FONT_LG,
     FONT_SM,
     FONT_XL,
+    HEADING_FONT_FAMILY,
     INTERNAL_GAP,
     MIN_H,
     MIN_SIDEBAR,
@@ -1059,7 +1060,7 @@ class CouncilWindow(QtWidgets.QMainWindow):
         title_block.setSpacing(2)
         title = QtWidgets.QLabel("PolyCouncil")
         title.setObjectName("HeroTitle")
-        title.setFont(make_font(FONT_XL, bold=True))
+        title.setFont(make_font(FONT_XL, bold=True, family=HEADING_FONT_FAMILY))
         subtitle = QtWidgets.QLabel(
             "Connect providers, select models, compose once, and review a readable council run without losing the thread."
         )
